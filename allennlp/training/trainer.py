@@ -1,33 +1,34 @@
-
+import datetime
 import logging
 import math
 import os
 import time
-import datetime
 import traceback
 from typing import Dict, Optional, List, Tuple, Union, Iterable, Any
 
 import torch
+import torch.distributed as dist
 import torch.optim.lr_scheduler
+from apex import amp
 
 from allennlp.common import Params
 from allennlp.common.checks import ConfigurationError, parse_cuda_device
+from allennlp.common.tqdm import Tqdm
 from allennlp.common.util import (dump_metrics, gpu_memory_mb, peak_memory_mb,
                                   lazy_groups_of)
-from allennlp.common.tqdm import Tqdm
 from allennlp.data.instance import Instance
 from allennlp.data.iterators.data_iterator import DataIterator, TensorDict
 from allennlp.models.model import Model
 from allennlp.nn import util as nn_util
+from allennlp.training import util as training_util
 from allennlp.training.checkpointer import Checkpointer
 from allennlp.training.learning_rate_schedulers import LearningRateScheduler
-from allennlp.training.momentum_schedulers import MomentumScheduler
 from allennlp.training.metric_tracker import MetricTracker
+from allennlp.training.momentum_schedulers import MomentumScheduler
+from allennlp.training.moving_average import MovingAverage
 from allennlp.training.optimizers import Optimizer
 from allennlp.training.tensorboard_writer import TensorboardWriter
 from allennlp.training.trainer_base import TrainerBase
-from allennlp.training import util as training_util
-from allennlp.training.moving_average import MovingAverage
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
@@ -60,7 +61,11 @@ class Trainer(TrainerBase):
                  should_log_parameter_statistics: bool = True,
                  should_log_learning_rate: bool = False,
                  log_batch_size_period: Optional[int] = None,
-                 moving_average: Optional[MovingAverage] = None) -> None:
+                 moving_average: Optional[MovingAverage] = None,
+                 mixed_precision: bool = False,
+                 distributed: bool = False,
+                 rank: int = 0,
+                 world_size: int = 1) -> None:
         """
         A trainer for doing supervised learning. It just takes a labeled dataset
         and a ``DataIterator``, and uses the supplied ``Optimizer`` to learn the weights
@@ -206,8 +211,8 @@ class Trainer(TrainerBase):
             if num_serialized_models_to_keep != 20 or \
                     keep_serialized_model_every_num_seconds is not None:
                 raise ConfigurationError(
-                        "When passing a custom Checkpointer, you may not also pass in separate checkpointer "
-                        "args 'num_serialized_models_to_keep' or 'keep_serialized_model_every_num_seconds'.")
+                    "When passing a custom Checkpointer, you may not also pass in separate checkpointer "
+                    "args 'num_serialized_models_to_keep' or 'keep_serialized_model_every_num_seconds'.")
             self._checkpointer = checkpointer
         else:
             self._checkpointer = Checkpointer(serialization_dir,
@@ -229,12 +234,12 @@ class Trainer(TrainerBase):
         self._batch_num_total = 0
 
         self._tensorboard = TensorboardWriter(
-                get_batch_num_total=lambda: self._batch_num_total,
-                serialization_dir=serialization_dir,
-                summary_interval=summary_interval,
-                histogram_interval=histogram_interval,
-                should_log_parameter_statistics=should_log_parameter_statistics,
-                should_log_learning_rate=should_log_learning_rate)
+            get_batch_num_total=lambda: self._batch_num_total,
+            serialization_dir=serialization_dir,
+            summary_interval=summary_interval,
+            histogram_interval=histogram_interval,
+            should_log_parameter_statistics=should_log_parameter_statistics,
+            should_log_learning_rate=should_log_learning_rate)
 
         self._log_batch_size_period = log_batch_size_period
 
@@ -243,6 +248,19 @@ class Trainer(TrainerBase):
         # Enable activation logging.
         if histogram_interval is not None:
             self._tensorboard.enable_activation_logging(self.model)
+
+        self._mixed_precision = mixed_precision
+
+        if self._mixed_precision:
+            self.model, self.optimizer = amp.initialize(self.model, self.optimizer, opt_level="O2", verbosity=0)
+
+        self._distributed = distributed
+        self._rank = rank
+        self._master = rank == 0
+        self._world_size = world_size
+
+        if self._distributed:
+            self._dist_model = torch.nn.parallel.DistributedDataParallel(self.model, device_ids=[self._rank])
 
     def rescale_gradients(self) -> Optional[float]:
         return training_util.rescale_gradients(self.model, self._grad_norm)
@@ -258,7 +276,10 @@ class Trainer(TrainerBase):
             assert len(batch_group) == 1
             batch = batch_group[0]
             batch = nn_util.move_to_device(batch, self._cuda_devices[0])
-            output_dict = self.model(**batch)
+            if self._distributed:
+                output_dict = self._dist_model(**batch)
+            else:
+                output_dict = self.model(**batch)
 
         try:
             loss = output_dict["loss"]
@@ -286,7 +307,10 @@ class Trainer(TrainerBase):
 
         train_loss = 0.0
         # Set the model to "train" mode.
-        self.model.train()
+        if self._distributed:
+            self._dist_model.train()
+        else:
+            self.model.train()
 
         num_gpus = len(self._cuda_devices)
 
@@ -295,7 +319,7 @@ class Trainer(TrainerBase):
                                             num_epochs=1,
                                             shuffle=self.shuffle)
         train_generator = lazy_groups_of(raw_train_generator, num_gpus)
-        num_training_batches = math.ceil(self.iterator.get_num_batches(self.train_data)/num_gpus)
+        num_training_batches = math.ceil(self.iterator.get_num_batches(self.train_data) / num_gpus)
         self._last_log = time.time()
         last_save_time = time.time()
 
@@ -305,10 +329,17 @@ class Trainer(TrainerBase):
 
         histogram_parameters = set(self.model.get_parameters_for_histogram_tensorboard_logging())
 
-
         logger.info("Training")
-        train_generator_tqdm = Tqdm.tqdm(train_generator,
-                                         total=num_training_batches)
+
+        # Having multiple tqdm bars in case of distributed training will be a mess. Hence only the master's progress
+        # is shown
+        if self._master:
+            train_generator_tqdm = Tqdm.tqdm(train_generator,
+                                             total=num_training_batches, desc=f"Trainer {self._rank}",
+                                             position=self._rank + 1)
+        else:
+            train_generator_tqdm = train_generator
+
         cumulative_batch_size = 0
         for batch_group in train_generator_tqdm:
             batches_this_epoch += 1
@@ -322,7 +353,12 @@ class Trainer(TrainerBase):
             if torch.isnan(loss):
                 raise ValueError("nan loss encountered")
 
-            loss.backward()
+            # For mixed precision, amp requires a separate way of handling as below
+            if self._mixed_precision:
+                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
 
             train_loss += loss.item()
 
@@ -335,7 +371,7 @@ class Trainer(TrainerBase):
             if self._momentum_scheduler:
                 self._momentum_scheduler.step_batch(batch_num_total)
 
-            if self._tensorboard.should_log_histograms_this_batch():
+            if self._tensorboard.should_log_histograms_this_batch() and self._master:
                 # get the magnitude of parameter updates for logging
                 # We need a copy of current parameters to compute magnitude of updates,
                 # and copy them to CPU so large models won't go OOM on the GPU.
@@ -355,28 +391,31 @@ class Trainer(TrainerBase):
             if self._moving_average is not None:
                 self._moving_average.apply(batch_num_total)
 
+            metrics = training_util.get_metrics(self.model, train_loss, batches_this_epoch,
+                                                reset=False, distributed=self._distributed, world_size=self._world_size,
+                                                rank=self._rank)
             # Update the description with the latest metrics
-            metrics = training_util.get_metrics(self.model, train_loss, batches_this_epoch)
             description = training_util.description_from_metrics(metrics)
 
-            train_generator_tqdm.set_description(description, refresh=False)
+            if self._master:
+                train_generator_tqdm.set_description(f"Trainer {self._rank} {description}", refresh=False)
 
             # Log parameter values to Tensorboard
-            if self._tensorboard.should_log_this_batch():
+            if self._tensorboard.should_log_this_batch() and self._master:
                 self._tensorboard.log_parameter_and_gradient_statistics(self.model, batch_grad_norm)
                 self._tensorboard.log_learning_rates(self.model, self.optimizer)
 
                 self._tensorboard.add_train_scalar("loss/loss_train", metrics["loss"])
                 self._tensorboard.log_metrics({"epoch_metrics/" + k: v for k, v in metrics.items()})
 
-            if self._tensorboard.should_log_histograms_this_batch():
+            if self._tensorboard.should_log_histograms_this_batch() and self._master:
                 self._tensorboard.log_histograms(self.model, histogram_parameters)
 
-            if self._log_batch_size_period:
+            if self._log_batch_size_period and self._master:
                 cur_batch = sum([training_util.get_batch_size(batch) for batch in batch_group])
                 cumulative_batch_size += cur_batch
                 if (batches_this_epoch - 1) % self._log_batch_size_period == 0:
-                    average = cumulative_batch_size/batches_this_epoch
+                    average = cumulative_batch_size / batches_this_epoch
                     logger.info(f"current batch size: {cur_batch} mean batch size: {average}")
                     self._tensorboard.add_train_scalar("current_batch_size", cur_batch)
                     self._tensorboard.add_train_scalar("mean_batch_size", average)
@@ -384,15 +423,17 @@ class Trainer(TrainerBase):
             # Save model if needed.
             if self._model_save_interval is not None and (
                     time.time() - last_save_time > self._model_save_interval
-            ):
+            ) and self._master:
                 last_save_time = time.time()
                 self._save_checkpoint(
-                        '{0}.{1}'.format(epoch, training_util.time_to_str(int(last_save_time)))
+                    '{0}.{1}'.format(epoch, training_util.time_to_str(int(last_save_time)))
                 )
-        metrics = training_util.get_metrics(self.model, train_loss, batches_this_epoch, reset=True)
+        metrics = training_util.get_metrics(self.model, train_loss, batches_this_epoch, reset=True,
+                                            distributed=self._distributed, world_size=self._world_size, rank=self._rank)
+
         metrics['cpu_memory_MB'] = peak_cpu_usage
         for (gpu_num, memory) in gpu_usage:
-            metrics['gpu_'+str(gpu_num)+'_memory_MB'] = memory
+            metrics['gpu_' + str(gpu_num) + '_memory_MB'] = memory
         return metrics
 
     def _validation_loss(self) -> Tuple[float, int]:
@@ -401,7 +442,10 @@ class Trainer(TrainerBase):
         """
         logger.info("Validating")
 
-        self.model.eval()
+        if self._distributed:
+            self._dist_model.eval()
+        else:
+            self.model.eval()
 
         # Replace parameter values with the shadow values from the moving averages.
         if self._moving_average is not None:
@@ -418,7 +462,7 @@ class Trainer(TrainerBase):
                                          num_epochs=1,
                                          shuffle=False)
         val_generator = lazy_groups_of(raw_val_generator, num_gpus)
-        num_validation_batches = math.ceil(val_iterator.get_num_batches(self._validation_data)/num_gpus)
+        num_validation_batches = math.ceil(val_iterator.get_num_batches(self._validation_data) / num_gpus)
         val_generator_tqdm = Tqdm.tqdm(val_generator,
                                        total=num_validation_batches)
         batches_this_epoch = 0
@@ -436,7 +480,9 @@ class Trainer(TrainerBase):
                 val_loss += loss.detach().cpu().numpy()
 
             # Update the description with the latest metrics
-            val_metrics = training_util.get_metrics(self.model, val_loss, batches_this_epoch)
+            val_metrics = training_util.get_metrics(self.model, val_loss, batches_this_epoch, reset=False,
+                                                    distributed=self._distributed, world_size=self._world_size,
+                                                    rank=self._rank)
             description = training_util.description_from_metrics(val_metrics)
             val_generator_tqdm.set_description(description, refresh=False)
 
@@ -483,14 +529,15 @@ class Trainer(TrainerBase):
                                                     train_metrics['cpu_memory_MB'])
             for key, value in train_metrics.items():
                 if key.startswith('gpu_'):
-                    metrics["peak_"+key] = max(metrics.get("peak_"+key, 0), value)
+                    metrics["peak_" + key] = max(metrics.get("peak_" + key, 0), value)
 
             if self._validation_data is not None:
                 with torch.no_grad():
                     # We have a validation set, so compute all the metrics on it.
                     val_loss, num_batches = self._validation_loss()
-                    val_metrics = training_util.get_metrics(self.model, val_loss, num_batches, reset=True)
-
+                    val_metrics = training_util.get_metrics(self.model, val_loss, num_batches, reset=True,
+                                                            distributed=self._distributed, world_size=self._world_size,
+                                                            rank=self._rank)
                     # Check validation metric for early stopping
                     this_epoch_val_metric = val_metrics[self._validation_metric]
                     self._metric_tracker.add_metric(this_epoch_val_metric)
@@ -499,10 +546,14 @@ class Trainer(TrainerBase):
                         logger.info("Ran out of patience.  Stopping training.")
                         break
 
-            self._tensorboard.log_metrics(train_metrics,
-                                          val_metrics=val_metrics,
-                                          log_to_console=True,
-                                          epoch=epoch + 1)  # +1 because tensorboard doesn't like 0
+            # After every epoch let the worker wait for confirmation to proceed based on early stopping test.
+            dist.barrier()
+
+            if self._master:
+                self._tensorboard.log_metrics(train_metrics,
+                                              val_metrics=val_metrics,
+                                              log_to_console=True,
+                                              epoch=epoch + 1)  # +1 because tensorboard doesn't like 0
 
             # Create overall metrics dict
             training_elapsed_time = time.time() - training_start_time
@@ -525,7 +576,7 @@ class Trainer(TrainerBase):
 
                 self._metric_tracker.best_epoch_metrics = val_metrics
 
-            if self._serialization_dir:
+            if self._serialization_dir and self._master:
                 dump_metrics(os.path.join(self._serialization_dir, f'metrics_epoch_{epoch}.json'), metrics)
 
             # The Scheduler API is agnostic to whether your schedule requires a validation metric -
@@ -535,27 +586,31 @@ class Trainer(TrainerBase):
             if self._momentum_scheduler:
                 self._momentum_scheduler.step(this_epoch_val_metric, epoch)
 
-            self._save_checkpoint(epoch)
+            if self._master:
+                self._save_checkpoint(epoch)
+                epoch_elapsed_time = time.time() - epoch_start_time
+                logger.info("Epoch duration: %s", datetime.timedelta(seconds=epoch_elapsed_time))
 
-            epoch_elapsed_time = time.time() - epoch_start_time
-            logger.info("Epoch duration: %s", datetime.timedelta(seconds=epoch_elapsed_time))
+                if epoch < self._num_epochs - 1:
+                    training_elapsed_time = time.time() - training_start_time
+                    estimated_time_remaining = training_elapsed_time * \
+                                               ((self._num_epochs - epoch_counter) / float(
+                                                   epoch - epoch_counter + 1) - 1)
+                    formatted_time = str(datetime.timedelta(seconds=int(estimated_time_remaining)))
+                    logger.info("Estimated training time remaining: %s", formatted_time)
 
-            if epoch < self._num_epochs - 1:
-                training_elapsed_time = time.time() - training_start_time
-                estimated_time_remaining = training_elapsed_time * \
-                    ((self._num_epochs - epoch_counter) / float(epoch - epoch_counter + 1) - 1)
-                formatted_time = str(datetime.timedelta(seconds=int(estimated_time_remaining)))
-                logger.info("Estimated training time remaining: %s", formatted_time)
+                epochs_trained += 1
 
-            epochs_trained += 1
+            # Wait for the master to save the checkpoint and gets ready for the next epoch
+            dist.barrier()
 
-        # make sure pending events are flushed to disk and files are closed properly
-        self._tensorboard.close()
-
-        # Load the best model state before returning
-        best_model_state = self._checkpointer.best_model_state()
-        if best_model_state:
-            self.model.load_state_dict(best_model_state)
+        if self._master:
+            # make sure pending events are flushed to disk and files are closed properly
+            self._tensorboard.close()
+            # Load the best model state before returning
+            best_model_state = self._checkpointer.best_model_state()
+            if best_model_state:
+                self.model.load_state_dict(best_model_state)
 
         return metrics
 
@@ -577,9 +632,9 @@ class Trainer(TrainerBase):
 
         # These are the training states we need to persist.
         training_states = {
-                "metric_tracker": self._metric_tracker.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "batch_num_total": self._batch_num_total
+            "metric_tracker": self._metric_tracker.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "batch_num_total": self._batch_num_total
         }
 
         # If we have a learning rate or momentum scheduler, we should persist them too.
@@ -589,10 +644,10 @@ class Trainer(TrainerBase):
             training_states["momentum_scheduler"] = self._momentum_scheduler.state_dict()
 
         self._checkpointer.save_checkpoint(
-                model_state=self.model.state_dict(),
-                epoch=epoch,
-                training_states=training_states,
-                is_best_so_far=self._metric_tracker.is_best_so_far())
+            model_state=self.model.state_dict(),
+            epoch=epoch,
+            training_states=training_states,
+            is_best_so_far=self._metric_tracker.is_best_so_far())
 
         # Restore the original values for parameters so that training will not be affected.
         if self._moving_average is not None:
@@ -704,18 +759,18 @@ class Trainer(TrainerBase):
             if 'keep_serialized_model_every_num_seconds' in params or \
                     'num_serialized_models_to_keep' in params:
                 raise ConfigurationError(
-                        "Checkpointer may be initialized either from the 'checkpointer' key or from the "
-                        "keys 'num_serialized_models_to_keep' and 'keep_serialized_model_every_num_seconds'"
-                        " but the passed config uses both methods.")
+                    "Checkpointer may be initialized either from the 'checkpointer' key or from the "
+                    "keys 'num_serialized_models_to_keep' and 'keep_serialized_model_every_num_seconds'"
+                    " but the passed config uses both methods.")
             checkpointer = Checkpointer.from_params(params.pop("checkpointer"))
         else:
             num_serialized_models_to_keep = params.pop_int("num_serialized_models_to_keep", 20)
             keep_serialized_model_every_num_seconds = params.pop_int(
-                    "keep_serialized_model_every_num_seconds", None)
+                "keep_serialized_model_every_num_seconds", None)
             checkpointer = Checkpointer(
-                    serialization_dir=serialization_dir,
-                    num_serialized_models_to_keep=num_serialized_models_to_keep,
-                    keep_serialized_model_every_num_seconds=keep_serialized_model_every_num_seconds)
+                serialization_dir=serialization_dir,
+                num_serialized_models_to_keep=num_serialized_models_to_keep,
+                keep_serialized_model_every_num_seconds=keep_serialized_model_every_num_seconds)
         model_save_interval = params.pop_float("model_save_interval", None)
         summary_interval = params.pop_int("summary_interval", 100)
         histogram_interval = params.pop_int("histogram_interval", None)
@@ -723,7 +778,17 @@ class Trainer(TrainerBase):
         should_log_learning_rate = params.pop_bool("should_log_learning_rate", False)
         log_batch_size_period = params.pop_int("log_batch_size_period", None)
 
+        mixed_precision = params.pop_bool("mixed_precision", False)
+
+        distributed = params.pop_bool("distributed", False)
+        world_size = params.pop_int("world_size", 1)
+        if distributed:
+            rank = model_device
+        else:
+            rank = 0
+
         params.assert_empty(cls.__name__)
+
         return cls(model, optimizer, iterator,
                    train_data, validation_data,
                    patience=patience,
@@ -744,4 +809,8 @@ class Trainer(TrainerBase):
                    should_log_parameter_statistics=should_log_parameter_statistics,
                    should_log_learning_rate=should_log_learning_rate,
                    log_batch_size_period=log_batch_size_period,
-                   moving_average=moving_average)
+                   moving_average=moving_average,
+                   mixed_precision=mixed_precision,
+                   distributed=distributed,
+                   rank=rank,
+                   world_size=world_size)

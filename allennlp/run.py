@@ -2,6 +2,7 @@
 import logging
 import os
 import sys
+import torch
 
 if os.environ.get("ALLENNLP_DEBUG"):
     LEVEL = logging.DEBUG
@@ -13,6 +14,8 @@ logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s
                     level=LEVEL)
 
 from allennlp.commands import main  # pylint: disable=wrong-import-position
+
+torch.multiprocessing.set_start_method("spawn")
 
 def run():
     main(prog="allennlp")

@@ -1,16 +1,14 @@
 """
 Various utilities that don't fit anwhere else.
 """
-from itertools import zip_longest, islice
-from typing import Any, Callable, Dict, List, Tuple, TypeVar, Iterable, Iterator
 import importlib
 import json
-import logging
+import os
 import pkgutil
 import random
 import subprocess
-import sys
-import os
+from itertools import zip_longest, islice
+from typing import Any, Callable, Dict, List, Tuple, TypeVar, Iterable, Iterator, Union
 
 try:
     import resource
@@ -29,8 +27,15 @@ from spacy.language import Language as SpacyModelType
 import allennlp
 from allennlp.common.checks import log_pytorch_version_info
 from allennlp.common.params import Params
-from allennlp.common.tqdm import Tqdm
 from allennlp.common.tee_logger import TeeLogger
+
+import sys
+import multiprocessing
+import logging
+from logging import Filter
+from logging.handlers import QueueHandler, QueueListener
+from allennlp.common.tee_logger import replace_cr_with_newline
+from torch.multiprocessing import Queue
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
@@ -80,6 +85,7 @@ def sanitize(x: Any) -> Any:  # pylint: disable=invalid-name,too-many-return-sta
                          "If this is your own custom class, add a `to_json(self)` method "
                          "that returns a JSON-like object.")
 
+
 def group_by_count(iterable: List[Any], count: int, default_value: Any) -> List[List[Any]]:
     """
     Takes a list and groups it into sublists of size ``count``, using ``default_value`` to pad the
@@ -94,7 +100,9 @@ def group_by_count(iterable: List[Any], count: int, default_value: Any) -> List[
     """
     return [list(l) for l in zip_longest(*[iter(iterable)] * count, fillvalue=default_value)]
 
+
 A = TypeVar('A')
+
 
 def lazy_groups_of(iterator: Iterator[A], group_size: int) -> Iterator[List[A]]:
     """
@@ -102,6 +110,7 @@ def lazy_groups_of(iterator: Iterator[A], group_size: int) -> Iterator[List[A]]:
     specified size. The last list may be smaller if there are instances left over.
     """
     return iter(lambda: list(islice(iterator, 0, group_size)), [])
+
 
 def pad_sequence_to_length(sequence: List,
                            desired_length: int,
@@ -205,49 +214,111 @@ def prepare_environment(params: Params):
 
     log_pytorch_version_info()
 
+
+class FileFriendlyLogFilter(Filter):
+    def filter(self, record):
+        record.msg = replace_cr_with_newline(record.msg)
+        return True
+
+
+class WorkerLogFilter(Filter):
+    def __init__(self, rank=-1):
+        super().__init__()
+        self._rank = rank
+
+    def filter(self, record):
+        if self._rank != -1:
+            record.msg = f"Rank {self._rank} | {record.msg}"
+        return True
+
+
 def prepare_global_logging(serialization_dir: str, file_friendly_logging: bool) -> logging.FileHandler:
     """
-    This function configures 3 global logging attributes - streaming stdout and stderr
-    to a file as well as the terminal, setting the formatting for the python logging
-    library and setting the interval frequency for the Tqdm progress bar.
-
-    Note that this function does not set the logging level, which is set in ``allennlp/run.py``.
+    Global logging is setup using this method. In a distributed setup, a multiprocessing queue is setup
+    which can be used by the workers to write their log messages. This initializers respective handlers
+    to pick messages from the queue and handle them to write to corresponding output buffers.
 
     Parameters
     ----------
-    serialization_dir : ``str``, required.
-        The directory to stream logs to.
-    file_friendly_logging : ``bool``, required.
-        Whether logs should clean the output to prevent carriage returns
-        (used to update progress bars on a single terminal line). This
-        option is typically only used if you are running in an environment
-        without a terminal.
+    log_file_path : ``str``, required
+        File path to write output log
+    error_log_file_path: ``str``, required
+        File path to write error log
 
     Returns
     -------
-    ``logging.FileHandler``
-        A logging file handler that can later be closed and removed from the global logger.
+    log_queue : ``Union[multiprocessing.Queue, torch.multiprocessing.Queue]``
+        A log queue to which the log handler listens to. This is used by workers
+        in a distributed setup to initialize worker specific log handlers(refer ``init_worker_logging`` method).
+        Messages posted in this queue by the workers are picked up and bubbled up to respective log handlers.
     """
+    # Multiprocessing queue to which the workers should log their messages
+    log_queue = Queue(-1)
 
-    # If we don't have a terminal as stdout,
-    # force tqdm to be nicer.
-    if not sys.stdout.isatty():
-        file_friendly_logging = True
+    # Handlers for stream/file logging
+    output_stream_log_handler = logging.StreamHandler(sys.stdout)
+    error_stream_log_handler = logging.StreamHandler(sys.stderr)
+    output_file_log_handler = logging.FileHandler(filename=os.path.join(serialization_dir, "stdout.log"))
+    error_file_log_handler = logging.FileHandler(filename=os.path.join(serialization_dir, "stderr.log"))
 
-    Tqdm.set_slower_interval(file_friendly_logging)
-    std_out_file = os.path.join(serialization_dir, "stdout.log")
-    sys.stdout = TeeLogger(std_out_file, # type: ignore
-                           sys.stdout,
-                           file_friendly_logging)
-    sys.stderr = TeeLogger(os.path.join(serialization_dir, "stderr.log"), # type: ignore
-                           sys.stderr,
-                           file_friendly_logging)
+    # Handle \r chars in tqdm output for file logging
+    file_friendly_log_filter = FileFriendlyLogFilter()
+    output_file_log_handler.addFilter(file_friendly_log_filter)
+    error_file_log_handler.addFilter(file_friendly_log_filter)
 
-    stdout_handler = logging.FileHandler(std_out_file)
-    stdout_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s'))
-    logging.getLogger().addHandler(stdout_handler)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-    return stdout_handler
+    output_stream_log_handler.setFormatter(formatter)
+    error_stream_log_handler.setFormatter(formatter)
+    output_file_log_handler.setFormatter(formatter)
+    error_file_log_handler.setFormatter(formatter)
+
+    output_file_log_handler.setLevel(logging.INFO)
+    error_file_log_handler.setLevel(logging.ERROR)
+    output_stream_log_handler.setLevel(logging.INFO)
+    error_stream_log_handler.setLevel(logging.ERROR)
+
+    # This listener listens to the `log_queue` and pushes the messages to the list of
+    # handlers specified.
+    listener = QueueListener(log_queue, output_file_log_handler, error_file_log_handler,
+                             output_stream_log_handler, error_stream_log_handler, respect_handler_level=True)
+
+    listener.start()
+
+    return log_queue
+
+
+def prepare_worker_logging(rank: int, log_queue: Union[multiprocessing.Queue, Queue]):
+    """
+    Method to initialize worker's logging in a distributed setup. The worker processes
+    always write their logs to the `log_queue`. Messages in this queue in turn gets picked
+    by parent's `QueueListener` and pushes them to respective file/stream log handlers.
+
+    Parameters
+    ----------
+    rank : ``int``, required
+        Rank of the worker
+    log_queue: ``Queue``, required
+        The common log queue to which the workers
+
+    Returns
+    -------
+    features : ``np.ndarray``
+        The corresponding log power spectrogram.
+    """
+    queue_handler = QueueHandler(log_queue)
+    worker_filter = WorkerLogFilter(rank)
+    queue_handler.addFilter(worker_filter)
+    queue_handler.setLevel(logging.INFO)
+
+    root_logger = logging.getLogger()
+    root_logger.addHandler(queue_handler)
+
+    # Default logger level is WARNING, hence the change. Otherwise, any worker logs
+    # are not going to get bubbled up to the parent's logger handlers from where the
+    # actual logs are written to the output
+    root_logger.setLevel(logging.INFO)
+
 
 def cleanup_global_logging(stdout_handler: logging.FileHandler) -> None:
     """
@@ -265,6 +336,7 @@ def cleanup_global_logging(stdout_handler: logging.FileHandler) -> None:
         sys.stdout = sys.stdout.cleanup()
     if isinstance(sys.stderr, TeeLogger):
         sys.stderr = sys.stderr.cleanup()
+
 
 LOADED_SPACY_MODELS: Dict[Tuple[str, bool, bool, bool], SpacyModelType] = {}
 
@@ -304,6 +376,7 @@ def get_spacy_model(spacy_model_name: str, pos_tags: bool, parse: bool, ner: boo
 
         LOADED_SPACY_MODELS[options] = spacy_model
     return LOADED_SPACY_MODELS[options]
+
 
 def import_submodules(package_name: str) -> None:
     """
@@ -359,6 +432,7 @@ def peak_memory_mb() -> float:
         # On Linux the result is in kilobytes.
         return peak / 1_000
 
+
 def gpu_memory_mb() -> Dict[int, int]:
     """
     Get the current GPU memory usage.
@@ -398,12 +472,14 @@ def ensure_list(iterable: Iterable[A]) -> List[A]:
     else:
         return list(iterable)
 
+
 def is_lazy(iterable: Iterable[A]) -> bool:
     """
     Checks if the given iterable is lazy,
     which here just means it's not a list.
     """
     return not isinstance(iterable, list)
+
 
 def get_frozen_and_tunable_parameter_names(model: torch.nn.Module) -> List:
     frozen_parameter_names = []
@@ -415,12 +491,14 @@ def get_frozen_and_tunable_parameter_names(model: torch.nn.Module) -> List:
             tunable_parameter_names.append(name)
     return [frozen_parameter_names, tunable_parameter_names]
 
+
 def dump_metrics(file_path: str, metrics: Dict[str, Any], log: bool = False) -> None:
     metrics_json = json.dumps(metrics, indent=2)
     with open(file_path, "w") as metrics_file:
         metrics_file.write(metrics_json)
     if log:
         logger.info("Metrics: %s", metrics_json)
+
 
 def flatten_filename(file_path: str) -> str:
     return file_path.replace('/', '_SLASH_')

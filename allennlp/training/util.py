@@ -1,35 +1,38 @@
 """
 Helper functions for Trainers
 """
-from typing import Any, Union, Dict, Iterable, List, Optional, Tuple
 import datetime
 import json
 import logging
-import pathlib
 import os
+import pathlib
 import shutil
+from typing import Any, Union, Dict, Iterable, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 from torch.nn.parallel import replicate, parallel_apply
 from torch.nn.parallel.scatter_gather import gather
 
 from allennlp.common.checks import ConfigurationError, check_for_gpu
 from allennlp.common.params import Params
 from allennlp.common.tqdm import Tqdm
-from allennlp.data.dataset_readers import DatasetReader
 from allennlp.data import Instance
+from allennlp.data.dataset_readers import DatasetReader
 from allennlp.data.iterators import DataIterator
 from allennlp.data.iterators.data_iterator import TensorDict
-from allennlp.models.model import Model
 from allennlp.models.archival import CONFIG_NAME
+from allennlp.models.model import Model
 from allennlp.nn import util as nn_util
 
 logger = logging.getLogger(__name__)
+
 
 # We want to warn people that tqdm ignores metrics that start with underscores
 # exactly once. This variable keeps track of whether we have.
 class HasBeenWarned:
     tqdm_ignores_underscores = False
+
 
 def sparse_clip_norm(parameters, max_norm, norm_type=2) -> float:
     """Clips gradient norm of an iterable of parameters.
@@ -99,7 +102,7 @@ def get_batch_size(batch: Union[Dict, torch.Tensor]) -> int:
     returns 0 otherwise.
     """
     if isinstance(batch, torch.Tensor):
-        return batch.size(0) # type: ignore
+        return batch.size(0)  # type: ignore
     elif isinstance(batch, Dict):
         return get_batch_size(next(iter(batch.values())))
     else:
@@ -112,8 +115,8 @@ def time_to_str(timestamp: int) -> str:
     """
     datetimestamp = datetime.datetime.fromtimestamp(timestamp)
     return '{:04d}-{:02d}-{:02d}-{:02d}-{:02d}-{:02d}'.format(
-            datetimestamp.year, datetimestamp.month, datetimestamp.day,
-            datetimestamp.hour, datetimestamp.minute, datetimestamp.second
+        datetimestamp.year, datetimestamp.month, datetimestamp.day,
+        datetimestamp.hour, datetimestamp.minute, datetimestamp.second
     )
 
 
@@ -307,6 +310,7 @@ def create_serialization_dir(
                                      "does not exist.  There is nothing to recover from.")
         os.makedirs(serialization_dir, exist_ok=True)
 
+
 def data_parallel(batch_group: List[TensorDict],
                   model: Model,
                   cuda_devices: List) -> Dict[str, torch.Tensor]:
@@ -335,6 +339,7 @@ def data_parallel(batch_group: List[TensorDict],
     losses = gather([output['loss'].unsqueeze(0) for output in outputs], used_device_ids[0], 0)
     return {'loss': losses.mean()}
 
+
 def enable_gradient_clipping(model: Model, grad_clipping: Optional[float]) -> None:
     if grad_clipping is not None:
         for parameter in model.parameters():
@@ -342,6 +347,7 @@ def enable_gradient_clipping(model: Model, grad_clipping: Optional[float]) -> No
                 parameter.register_hook(lambda grad: nn_util.clamp_tensor(grad,
                                                                           minimum=-grad_clipping,
                                                                           maximum=grad_clipping))
+
 
 def rescale_gradients(model: Model, grad_norm: Optional[float] = None) -> Optional[float]:
     """
@@ -353,7 +359,14 @@ def rescale_gradients(model: Model, grad_norm: Optional[float] = None) -> Option
         return sparse_clip_norm(parameters_to_clip, grad_norm)
     return None
 
-def get_metrics(model: Model, total_loss: float, num_batches: int, reset: bool = False) -> Dict[str, float]:
+
+def get_metrics(model: Model,
+                total_loss: float,
+                num_batches: int,
+                reset: bool = False,
+                distributed: bool = False,
+                world_size: int = 1,
+                rank: int = 0) -> Dict[str, float]:
     """
     Gets the metrics but sets ``"loss"`` to
     the total loss divided by the ``num_batches`` so that
@@ -361,7 +374,25 @@ def get_metrics(model: Model, total_loss: float, num_batches: int, reset: bool =
     """
     metrics = model.get_metrics(reset=reset)
     metrics["loss"] = float(total_loss / num_batches) if num_batches > 0 else 0.0
-    return metrics
+    if not distributed:
+        return metrics
+    else:
+        return aggregate_metrics_from_dist_group(metrics, world_size, rank)
+
+
+def aggregate_metrics_from_dist_group(metrics: Dict[str, float], world_size: int, rank: int) -> Dict[str, float]:
+    assert (world_size > 1)
+    aggregated_metrics = {}
+    for metric_name, metric_val in metrics.items():
+        metric_tensor = torch.tensor(metric_val).to(torch.device(rank))
+        metric_gathered = [torch.ones_like(metric_tensor) for _ in range(world_size)]
+
+        dist.all_gather(metric_gathered, metric_tensor)
+
+        metric_gathered = torch.tensor(metric_gathered)
+        aggregated_metrics[metric_name] = metric_gathered.mean().item()
+
+    return aggregated_metrics
 
 
 def evaluate(model: Model,
@@ -409,7 +440,7 @@ def evaluate(model: Model,
                 metrics["loss"] = total_loss / total_weight
 
             if (not HasBeenWarned.tqdm_ignores_underscores and
-                        any(metric_name.startswith("_") for metric_name in metrics)):
+                    any(metric_name.startswith("_") for metric_name in metrics)):
                 logger.warning("Metrics with names beginning with \"_\" will "
                                "not be logged to the tqdm progress bar.")
                 HasBeenWarned.tqdm_ignores_underscores = True
@@ -427,9 +458,10 @@ def evaluate(model: Model,
 
         return final_metrics
 
+
 def description_from_metrics(metrics: Dict[str, float]) -> str:
     if (not HasBeenWarned.tqdm_ignores_underscores and
-                any(metric_name.startswith("_") for metric_name in metrics)):
+            any(metric_name.startswith("_") for metric_name in metrics)):
         logger.warning("Metrics with names beginning with \"_\" will "
                        "not be logged to the tqdm progress bar.")
         HasBeenWarned.tqdm_ignores_underscores = True
