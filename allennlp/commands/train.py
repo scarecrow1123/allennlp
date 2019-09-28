@@ -45,21 +45,21 @@ import argparse
 import logging
 import os
 import traceback
-from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from torch.multiprocessing import Queue
+
 from allennlp.commands.subcommand import Subcommand
-from allennlp.common.checks import check_for_gpu, parse_cuda_device
 from allennlp.common import Params
+from allennlp.common.checks import check_for_gpu, parse_cuda_device
 from allennlp.common.util import prepare_environment, prepare_global_logging, prepare_worker_logging, dump_metrics
 from allennlp.models.archival import archive_model, CONFIG_NAME
 from allennlp.models.model import Model, _DEFAULT_WEIGHTS
 from allennlp.training.trainer import Trainer
-from allennlp.training.trainer_base import TrainerBase
 from allennlp.training.trainer_pieces import TrainerPieces
 from allennlp.training.util import create_serialization_dir, evaluate
-from torch.multiprocessing import Queue
+
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
 
@@ -107,7 +107,7 @@ class Train(Subcommand):
                                type=str,
                                default='',
                                help='Prefix to use for data caching, giving current parameter '
-                               'settings a name in the cache, instead of computing a hash')
+                                    'settings a name in the cache, instead of computing a hash')
 
         subparser.set_defaults(func=train_model_from_args)
 
@@ -225,7 +225,6 @@ def train_model(params: Params,
 
     trainer_type = params.get("trainer", {}).get("type", "default")
 
-
     if distributed:
         logging.info("Switching to distributed training mode since multiple GPUs are configured")
         os.environ['MASTER_ADDR'] = '127.0.0.1'
@@ -273,33 +272,18 @@ def train_worker(rank: int,
             params["trainer"]["distributed"] = True
             params["trainer"]["world_size"] = world_size
 
-            pieces = TrainerPieces.from_params(params,  # pylint: disable=no-member
-                                               serialization_dir,
-                                               recover,
-                                               cache_directory,
-                                               cache_prefix)
-
-            trainer = Trainer.from_params(model=pieces.model,
-                                                     serialization_dir=serialization_dir,
-                                                     iterator=pieces.iterator,
-                                                     train_data=pieces.train_dataset,
-                                                     validation_data=pieces.validation_dataset,
-                                                     params=pieces.params,
-                                                     validation_iterator=pieces.validation_iterator)
-
-        else:
-            pieces = TrainerPieces.from_params(params,  # pylint: disable=no-member
-                                               serialization_dir,
-                                               recover,
-                                               cache_directory,
-                                               cache_prefix)
-            trainer = Trainer.from_params(model=pieces.model,
-                                          serialization_dir=serialization_dir,
-                                          iterator=pieces.iterator,
-                                          train_data=pieces.train_dataset,
-                                          validation_data=pieces.validation_dataset,
-                                          params=pieces.params,
-                                          validation_iterator=pieces.validation_iterator)
+        pieces = TrainerPieces.from_params(params,  # pylint: disable=no-member
+                                           serialization_dir,
+                                           recover,
+                                           cache_directory,
+                                           cache_prefix)
+        trainer = Trainer.from_params(model=pieces.model,
+                                      serialization_dir=serialization_dir,
+                                      iterator=pieces.iterator,
+                                      train_data=pieces.train_dataset,
+                                      validation_data=pieces.validation_dataset,
+                                      params=pieces.params,
+                                      validation_iterator=pieces.validation_iterator)
 
         params.assert_empty('base train command')
 
