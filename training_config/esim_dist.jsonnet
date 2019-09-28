@@ -72,7 +72,9 @@
         "type": "bucket",
         "sorting_keys": [["premise", "num_tokens"],
                          ["hypothesis", "num_tokens"]],
-        "batch_size": 64
+        "batch_size": 64,
+        "skip_smaller_batches": true,
+        "instances_per_epoch": 150000
     },
     "trainer": {
         "optimizer": {
