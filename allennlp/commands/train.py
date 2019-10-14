@@ -53,7 +53,8 @@ from torch.multiprocessing import Queue
 from allennlp.commands.subcommand import Subcommand
 from allennlp.common import Params
 from allennlp.common.checks import check_for_gpu, parse_cuda_device
-from allennlp.common.util import prepare_environment, prepare_global_logging, prepare_worker_logging, dump_metrics
+from allennlp.common.util import prepare_environment, prepare_global_logging, prepare_worker_logging, dump_metrics, \
+    import_submodules
 from allennlp.models.archival import archive_model, CONFIG_NAME
 from allennlp.models.model import Model, _DEFAULT_WEIGHTS
 from allennlp.training.trainer import Trainer
@@ -125,7 +126,8 @@ def train_model_from_args(args: argparse.Namespace):
                           args.recover,
                           args.force,
                           args.cache_directory,
-                          args.cache_prefix)
+                          args.cache_prefix,
+                          args.include_package)
 
 
 def train_model_from_file(parameter_filename: str,
@@ -135,7 +137,8 @@ def train_model_from_file(parameter_filename: str,
                           recover: bool = False,
                           force: bool = False,
                           cache_directory: str = None,
-                          cache_prefix: str = None) -> Model:
+                          cache_prefix: str = None,
+                          include_package: str = None) -> Model:
     """
     A wrapper around :func:`train_model` which loads the params from a file.
 
@@ -169,7 +172,7 @@ def train_model_from_file(parameter_filename: str,
                        file_friendly_logging,
                        recover,
                        force,
-                       cache_directory, cache_prefix)
+                       cache_directory, cache_prefix, include_package)
 
 
 def train_model(params: Params,
@@ -178,7 +181,8 @@ def train_model(params: Params,
                 recover: bool = False,
                 force: bool = False,
                 cache_directory: str = None,
-                cache_prefix: str = None) -> Model:
+                cache_prefix: str = None,
+                include_package: str = None) -> Model:
     """
     Trains the model specified in the given :class:`Params` object, using the data and training
     parameters also specified in that object, and saves the results in ``serialization_dir``.
@@ -233,10 +237,11 @@ def train_model(params: Params,
         n_gpus = len(device_id)
         torch.multiprocessing.spawn(train_worker, args=(params.duplicate(),
                                                         serialization_dir, log_queue, recover, cache_directory,
-                                                        cache_prefix, n_gpus),
+                                                        cache_prefix, n_gpus, include_package),
                                     nprocs=n_gpus)
     else:
-        train_worker(0, params.duplicate(), serialization_dir, log_queue, recover, cache_directory, cache_prefix, 1)
+        train_worker(0, params.duplicate(), serialization_dir, log_queue, recover, cache_directory, cache_prefix, 1,
+                     include_package)
 
         # Now tar up results
         archive_model(serialization_dir, files_to_archive=params.files_to_archive)
@@ -253,7 +258,8 @@ def train_worker(rank: int,
                  recover: bool = False,
                  cache_directory: str = None,
                  cache_prefix: str = None,
-                 world_size: int = 1):
+                 world_size: int = 1,
+                 include_package: str = None):
     try:
         prepare_worker_logging(rank, log_queue)
         logging.info(f"Worker {rank} started with {world_size} world size")
@@ -263,6 +269,8 @@ def train_worker(rank: int,
         evaluate_on_test = params.pop_bool("evaluate_on_test", False)
 
         if distributed:
+            for package_name in include_package:
+                import_submodules(package_name)
             torch.cuda.set_device(rank)
             dist.init_process_group(backend='nccl',
                                     world_size=world_size,
