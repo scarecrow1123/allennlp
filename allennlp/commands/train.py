@@ -223,8 +223,6 @@ def train_model(params: Params,
 
     log_queue = prepare_global_logging(serialization_dir, True)
 
-    prepare_environment(params)
-
     params.to_file(os.path.join(serialization_dir, CONFIG_NAME))
 
     trainer_type = params.get("trainer", {}).get("type", "default")
@@ -263,6 +261,9 @@ def train_worker(rank: int,
     try:
         prepare_worker_logging(rank, log_queue)
         logging.info(f"Worker {rank} started with {world_size} world size")
+
+        prepare_environment(params)
+
         distributed = world_size > 1
         master = rank == 0
 
