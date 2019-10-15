@@ -547,7 +547,8 @@ class Trainer(TrainerBase):
                         break
 
             # After every epoch let the worker wait for confirmation to proceed based on early stopping test.
-            dist.barrier()
+            if self._distributed:
+                dist.barrier()
 
             if self._master:
                 self._tensorboard.log_metrics(train_metrics,
@@ -602,7 +603,8 @@ class Trainer(TrainerBase):
                 epochs_trained += 1
 
             # Wait for the master to save the checkpoint and gets ready for the next epoch
-            dist.barrier()
+            if self._distributed:
+                dist.barrier()
 
         if self._master:
             # make sure pending events are flushed to disk and files are closed properly
