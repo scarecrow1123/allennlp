@@ -253,7 +253,7 @@ def prepare_global_logging(serialization_dir: str, rank: int = 0,
     output_file_log_handler.addFilter(file_friendly_log_filter)
     error_file_log_handler.addFilter(file_friendly_log_filter)
 
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 
     root_logger = logging.getLogger()
 
