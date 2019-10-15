@@ -8,7 +8,7 @@ import pkgutil
 import random
 import subprocess
 from itertools import zip_longest, islice
-from typing import Any, Callable, Dict, List, Tuple, TypeVar, Iterable, Iterator, Union
+from typing import Any, Callable, Dict, List, Tuple, TypeVar, Iterable, Iterator
 
 try:
     import resource
@@ -27,15 +27,11 @@ from spacy.language import Language as SpacyModelType
 import allennlp
 from allennlp.common.checks import log_pytorch_version_info
 from allennlp.common.params import Params
-from allennlp.common.tee_logger import TeeLogger
 
 import sys
-import multiprocessing
 import logging
 from logging import Filter
-from logging.handlers import QueueHandler, QueueListener
 from allennlp.common.tee_logger import replace_cr_with_newline
-from torch.multiprocessing import Queue
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
@@ -232,110 +228,58 @@ class WorkerLogFilter(Filter):
         return True
 
 
-def prepare_global_logging(serialization_dir: str, file_friendly_logging: bool) -> logging.FileHandler:
-    """
-    Global logging is setup using this method. In a distributed setup, a multiprocessing queue is setup
-    which can be used by the workers to write their log messages. This initializers respective handlers
-    to pick messages from the queue and handle them to write to corresponding output buffers.
-
-    Parameters
-    ----------
-    log_file_path : ``str``, required
-        File path to write output log
-    error_log_file_path: ``str``, required
-        File path to write error log
-
-    Returns
-    -------
-    log_queue : ``Union[multiprocessing.Queue, torch.multiprocessing.Queue]``
-        A log queue to which the log handler listens to. This is used by workers
-        in a distributed setup to initialize worker specific log handlers(refer ``init_worker_logging`` method).
-        Messages posted in this queue by the workers are picked up and bubbled up to respective log handlers.
-    """
-    # Multiprocessing queue to which the workers should log their messages
-    log_queue = Queue(-1)
-
+def prepare_global_logging(serialization_dir: str, rank: int = 0,
+                           world_size: int = 1) -> None:
     # Handlers for stream/file logging
     output_stream_log_handler = logging.StreamHandler(sys.stdout)
     error_stream_log_handler = logging.StreamHandler(sys.stderr)
-    output_file_log_handler = logging.FileHandler(filename=os.path.join(serialization_dir, "stdout.log"))
-    error_file_log_handler = logging.FileHandler(filename=os.path.join(serialization_dir, "stderr.log"))
 
-    # Handle \r chars in tqdm output for file logging
+    if world_size == 1:
+        # This case is not distributed training and hence will stick to the older
+        # log format
+        output_file_log_handler = logging.FileHandler(
+            filename=os.path.join(serialization_dir, f"stdout.log"))
+        error_file_log_handler = logging.FileHandler(
+            filename=os.path.join(serialization_dir, f"stderr.log"))
+    else:
+        # Create log files with worker ids
+        output_file_log_handler = logging.FileHandler(
+            filename=os.path.join(serialization_dir, f"stdout_worker{rank}.log"))
+        error_file_log_handler = logging.FileHandler(
+            filename=os.path.join(serialization_dir, f"stderr_worker{rank}.log"))
+
+    # file handlers need to be handled for tqdm's \r char
     file_friendly_log_filter = FileFriendlyLogFilter()
     output_file_log_handler.addFilter(file_friendly_log_filter)
     error_file_log_handler.addFilter(file_friendly_log_filter)
 
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-    output_stream_log_handler.setFormatter(formatter)
-    error_stream_log_handler.setFormatter(formatter)
+    root_logger = logging.getLogger()
+
     output_file_log_handler.setFormatter(formatter)
     error_file_log_handler.setFormatter(formatter)
 
     output_file_log_handler.setLevel(logging.INFO)
     error_file_log_handler.setLevel(logging.ERROR)
-    output_stream_log_handler.setLevel(logging.INFO)
-    error_stream_log_handler.setLevel(logging.ERROR)
 
-    # This listener listens to the `log_queue` and pushes the messages to the list of
-    # handlers specified.
-    listener = QueueListener(log_queue, output_file_log_handler, error_file_log_handler,
-                             output_stream_log_handler, error_stream_log_handler, respect_handler_level=True)
+    root_logger.addHandler(output_file_log_handler)
+    root_logger.addHandler(error_file_log_handler)
 
-    listener.start()
+    if rank == 0:
+        # stdout/stderr handlers are added only for the
+        # master worker. This is to avoid cluttering the console
+        # screen with too many log messages from all workers.
+        output_stream_log_handler.setFormatter(formatter)
+        error_stream_log_handler.setFormatter(formatter)
 
-    return log_queue
+        output_stream_log_handler.setLevel(logging.INFO)
+        error_stream_log_handler.setLevel(logging.ERROR)
 
+        root_logger.addHandler(output_stream_log_handler)
+        root_logger.addHandler(error_stream_log_handler)
 
-def prepare_worker_logging(rank: int, log_queue: Union[multiprocessing.Queue, Queue]):
-    """
-    Method to initialize worker's logging in a distributed setup. The worker processes
-    always write their logs to the `log_queue`. Messages in this queue in turn gets picked
-    by parent's `QueueListener` and pushes them to respective file/stream log handlers.
-
-    Parameters
-    ----------
-    rank : ``int``, required
-        Rank of the worker
-    log_queue: ``Queue``, required
-        The common log queue to which the workers
-
-    Returns
-    -------
-    features : ``np.ndarray``
-        The corresponding log power spectrogram.
-    """
-    queue_handler = QueueHandler(log_queue)
-    worker_filter = WorkerLogFilter(rank)
-    queue_handler.addFilter(worker_filter)
-    queue_handler.setLevel(logging.INFO)
-
-    root_logger = logging.getLogger()
-    root_logger.addHandler(queue_handler)
-
-    # Default logger level is WARNING, hence the change. Otherwise, any worker logs
-    # are not going to get bubbled up to the parent's logger handlers from where the
-    # actual logs are written to the output
     root_logger.setLevel(logging.INFO)
-
-
-def cleanup_global_logging(stdout_handler: logging.FileHandler) -> None:
-    """
-    This function closes any open file handles and logs set up by `prepare_global_logging`.
-
-    Parameters
-    ----------
-    stdout_handler : ``logging.FileHandler``, required.
-        The file handler returned from `prepare_global_logging`, attached to the global logger.
-    """
-    stdout_handler.close()
-    logging.getLogger().removeHandler(stdout_handler)
-
-    if isinstance(sys.stdout, TeeLogger):
-        sys.stdout = sys.stdout.cleanup()
-    if isinstance(sys.stderr, TeeLogger):
-        sys.stderr = sys.stderr.cleanup()
 
 
 LOADED_SPACY_MODELS: Dict[Tuple[str, bool, bool, bool], SpacyModelType] = {}

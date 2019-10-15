@@ -53,7 +53,7 @@ from torch.multiprocessing import Queue
 from allennlp.commands.subcommand import Subcommand
 from allennlp.common import Params
 from allennlp.common.checks import check_for_gpu, parse_cuda_device
-from allennlp.common.util import prepare_environment, prepare_global_logging, prepare_worker_logging, dump_metrics, \
+from allennlp.common.util import prepare_environment, prepare_global_logging, dump_metrics, \
     import_submodules
 from allennlp.models.archival import archive_model, CONFIG_NAME
 from allennlp.models.model import Model, _DEFAULT_WEIGHTS
@@ -221,11 +221,7 @@ def train_model(params: Params,
     device_id = parse_cuda_device(cuda_device)
     distributed = isinstance(device_id, list) and len(device_id) > 1
 
-    log_queue = prepare_global_logging(serialization_dir, True)
-
     params.to_file(os.path.join(serialization_dir, CONFIG_NAME))
-
-    trainer_type = params.get("trainer", {}).get("type", "default")
 
     if distributed:
         logging.info("Switching to distributed training mode since multiple GPUs are configured")
@@ -234,11 +230,11 @@ def train_model(params: Params,
 
         n_gpus = len(device_id)
         torch.multiprocessing.spawn(train_worker, args=(params.duplicate(),
-                                                        serialization_dir, log_queue, recover, cache_directory,
+                                                        serialization_dir, recover, cache_directory,
                                                         cache_prefix, n_gpus, include_package),
                                     nprocs=n_gpus)
     else:
-        train_worker(0, params.duplicate(), serialization_dir, log_queue, recover, cache_directory, cache_prefix, 1,
+        train_worker(0, params.duplicate(), serialization_dir, recover, cache_directory, cache_prefix, 1,
                      include_package)
 
         # Now tar up results
@@ -252,14 +248,13 @@ def train_model(params: Params,
 def train_worker(rank: int,
                  params: Params,
                  serialization_dir: str,
-                 log_queue: Queue,
                  recover: bool = False,
                  cache_directory: str = None,
                  cache_prefix: str = None,
                  world_size: int = 1,
                  include_package: str = None):
     try:
-        prepare_worker_logging(rank, log_queue)
+        prepare_global_logging(serialization_dir, rank, world_size)
         logging.info(f"Worker {rank} started with {world_size} world size")
 
         prepare_environment(params)
