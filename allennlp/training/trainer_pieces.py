@@ -38,7 +38,8 @@ class TrainerPieces(NamedTuple):
                     serialization_dir: str,
                     recover: bool = False,
                     cache_directory: str = None,
-                    cache_prefix: str = None) -> 'TrainerPieces':
+                    cache_prefix: str = None,
+                    rank: int = 0) -> 'TrainerPieces':
         all_datasets = training_util.datasets_from_params(params, cache_directory, cache_prefix)
         datasets_for_vocab_creation = set(params.pop("datasets_for_vocab_creation", all_datasets))
 
@@ -69,7 +70,8 @@ class TrainerPieces(NamedTuple):
         model.extend_embedder_vocab()
 
         # Initializing the model can have side effect of expanding the vocabulary
-        vocab.save_to_files(os.path.join(serialization_dir, "vocabulary"))
+        if rank == 0:
+            vocab.save_to_files(os.path.join(serialization_dir, "vocabulary"))
 
         iterator = DataIterator.from_params(params.pop("iterator"))
         iterator.index_with(model.vocab)

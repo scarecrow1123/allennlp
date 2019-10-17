@@ -289,7 +289,8 @@ def train_worker(rank: int,
                                        serialization_dir,
                                        recover,
                                        cache_directory,
-                                       cache_prefix)
+                                       cache_prefix,
+                                       rank)
     trainer = Trainer.from_params(model=pieces.model,
                                   serialization_dir=serialization_dir,
                                   iterator=pieces.iterator,
