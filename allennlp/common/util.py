@@ -228,7 +228,7 @@ class WorkerLogFilter(Filter):
         return True
 
 
-def prepare_global_logging(serialization_dir: str, rank: int = 0,
+def prepare_global_logging(serialization_dir: str, file_friendly_logging: bool, rank: int = 0,
                            world_size: int = 1) -> None:
     # Handlers for stream/file logging
     output_stream_log_handler = logging.StreamHandler(sys.stdout)
@@ -236,7 +236,7 @@ def prepare_global_logging(serialization_dir: str, rank: int = 0,
 
     if world_size == 1:
         # This case is not distributed training and hence will stick to the older
-        # log format
+        # log file names
         output_file_log_handler = logging.FileHandler(
             filename=os.path.join(serialization_dir, f"stdout.log"))
         error_file_log_handler = logging.FileHandler(
@@ -275,6 +275,10 @@ def prepare_global_logging(serialization_dir: str, rank: int = 0,
 
         output_stream_log_handler.setLevel(logging.INFO)
         error_stream_log_handler.setLevel(logging.ERROR)
+
+        if file_friendly_logging:
+            output_stream_log_handler.addFilter(file_friendly_log_filter)
+            error_stream_log_handler.addFilter(file_friendly_log_filter)
 
         root_logger.addHandler(output_stream_log_handler)
         root_logger.addHandler(error_stream_log_handler)

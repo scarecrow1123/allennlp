@@ -44,7 +44,6 @@ which to write the results.
 import argparse
 import logging
 import os
-import traceback
 
 import torch
 import torch.distributed as dist
@@ -233,11 +232,13 @@ def train_model(params: Params,
         assert n_gpus > 1
 
         torch.multiprocessing.spawn(train_worker, args=(params.duplicate(),
-                                                        serialization_dir, recover, cache_directory,
+                                                        serialization_dir, file_friendly_logging, recover,
+                                                        cache_directory,
                                                         cache_prefix, n_gpus, include_package),
                                     nprocs=n_gpus)
     else:
-        train_worker(0, params.duplicate(), serialization_dir, recover, cache_directory, cache_prefix, 1,
+        train_worker(0, params.duplicate(), serialization_dir, file_friendly_logging, recover, cache_directory,
+                     cache_prefix, 1,
                      include_package)
 
         # Now tar up results
@@ -251,12 +252,13 @@ def train_model(params: Params,
 def train_worker(rank: int,
                  params: Params,
                  serialization_dir: str,
+                 file_friendly_logging: bool,
                  recover: bool = False,
                  cache_directory: str = None,
                  cache_prefix: str = None,
                  world_size: int = 1,
                  include_package: str = None) -> None:
-    prepare_global_logging(serialization_dir, rank, world_size)
+    prepare_global_logging(serialization_dir, file_friendly_logging, rank, world_size)
     prepare_environment(params)
 
     distributed = world_size > 1
