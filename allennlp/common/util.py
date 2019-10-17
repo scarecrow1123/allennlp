@@ -230,7 +230,7 @@ class WorkerLogFilter(Filter):
 
 def prepare_global_logging(serialization_dir: str, file_friendly_logging: bool, rank: int = 0,
                            world_size: int = 1) -> None:
-    # Handlers for stream/file logging
+    # Handlers for stdout/err logging
     output_stream_log_handler = logging.StreamHandler(sys.stdout)
     error_stream_log_handler = logging.StreamHandler(sys.stderr)
 
@@ -248,23 +248,18 @@ def prepare_global_logging(serialization_dir: str, file_friendly_logging: bool, 
         error_file_log_handler = logging.FileHandler(
             filename=os.path.join(serialization_dir, f"stderr_worker{rank}.log"))
 
-    # file handlers need to be handled for tqdm's \r char
-    file_friendly_log_filter = FileFriendlyLogFilter()
-    output_file_log_handler.addFilter(file_friendly_log_filter)
-    error_file_log_handler.addFilter(file_friendly_log_filter)
+        # This adds the worker's rank to messages being logged to files.
+        # This will help when combining multiple worker log files using `less` command.
+        worker_filter = WorkerLogFilter(rank)
+        output_file_log_handler.addFilter(worker_filter)
+        error_file_log_handler.addFilter(worker_filter)
 
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 
     root_logger = logging.getLogger()
 
-    output_file_log_handler.setFormatter(formatter)
-    error_file_log_handler.setFormatter(formatter)
-
-    output_file_log_handler.setLevel(logging.INFO)
-    error_file_log_handler.setLevel(logging.ERROR)
-
-    root_logger.addHandler(output_file_log_handler)
-    root_logger.addHandler(error_file_log_handler)
+    # file handlers need to be handled for tqdm's \r char
+    file_friendly_log_filter = FileFriendlyLogFilter()
 
     if rank == 0:
         # stdout/stderr handlers are added only for the
@@ -282,6 +277,18 @@ def prepare_global_logging(serialization_dir: str, file_friendly_logging: bool, 
 
         root_logger.addHandler(output_stream_log_handler)
         root_logger.addHandler(error_stream_log_handler)
+
+    output_file_log_handler.addFilter(file_friendly_log_filter)
+    error_file_log_handler.addFilter(file_friendly_log_filter)
+
+    output_file_log_handler.setFormatter(formatter)
+    error_file_log_handler.setFormatter(formatter)
+
+    output_file_log_handler.setLevel(logging.INFO)
+    error_file_log_handler.setLevel(logging.ERROR)
+
+    root_logger.addHandler(output_file_log_handler)
+    root_logger.addHandler(error_file_log_handler)
 
     root_logger.setLevel(logging.INFO)
 
