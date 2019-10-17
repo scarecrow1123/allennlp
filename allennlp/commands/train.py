@@ -255,75 +255,74 @@ def train_worker(rank: int,
                  cache_directory: str = None,
                  cache_prefix: str = None,
                  world_size: int = 1,
-                 include_package: str = None):
+                 include_package: str = None) -> None:
+    prepare_global_logging(serialization_dir, rank, world_size)
+    prepare_environment(params)
+
+    distributed = world_size > 1
+    master = rank == 0
+
+    evaluate_on_test = params.pop_bool("evaluate_on_test", False)
+
+    if distributed:
+        # Since the worker is spawned and not forked, the extra imports
+        # need to be done again.
+        for package_name in include_package:
+            import_submodules(package_name)
+
+        torch.cuda.set_device(rank)
+        dist.init_process_group(backend='nccl',
+                                world_size=world_size,
+                                rank=rank)
+        logging.info(
+            f"Process group of world size {world_size} initialized for distributed training in worker {rank}")
+
+        # Till now, "cuda_device" will be a list of ids as configured originally
+        # in params. But a worker trainer needs to only know about its specific
+        # GPU id.
+        params["trainer"]["cuda_device"] = rank
+        params["trainer"]["world_size"] = world_size
+
+    pieces = TrainerPieces.from_params(params,  # pylint: disable=no-member
+                                       serialization_dir,
+                                       recover,
+                                       cache_directory,
+                                       cache_prefix)
+    trainer = Trainer.from_params(model=pieces.model,
+                                  serialization_dir=serialization_dir,
+                                  iterator=pieces.iterator,
+                                  train_data=pieces.train_dataset,
+                                  validation_data=pieces.validation_dataset,
+                                  params=pieces.params,
+                                  validation_iterator=pieces.validation_iterator)
+
+    params.assert_empty('base train command')
+
     try:
-        prepare_global_logging(serialization_dir, rank, world_size)
-        logging.info(f"Worker {rank} started with {world_size} world size")
+        metrics = trainer.train()
+    except KeyboardInterrupt:
+        # if we have completed an epoch, try to create a model archive.
+        if master and os.path.exists(os.path.join(serialization_dir, _DEFAULT_WEIGHTS)):
+            logging.info("Training interrupted by the user. Attempting to create "
+                         "a model archive using the current best epoch weights.")
+            archive_model(serialization_dir, files_to_archive=params.files_to_archive)
+        raise
 
-        prepare_environment(params)
+    if master:
+        # Evaluate
+        evaluation_iterator = pieces.validation_iterator or pieces.iterator
+        evaluation_dataset = pieces.test_dataset
 
-        distributed = world_size > 1
-        master = rank == 0
+        if evaluation_dataset and evaluate_on_test:
+            logger.info("The model will be evaluated using the best epoch weights.")
+            test_metrics = evaluate(trainer.model, evaluation_dataset, evaluation_iterator,
+                                    cuda_device=trainer._cuda_devices[0],  # pylint: disable=protected-access,
+                                    # TODO(brendanr): Pass in an arg following Joel's trainer refactor.
+                                    batch_weight_key="")
 
-        evaluate_on_test = params.pop_bool("evaluate_on_test", False)
-
-        if distributed:
-            for package_name in include_package:
-                import_submodules(package_name)
-
-            torch.cuda.set_device(rank)
-            dist.init_process_group(backend='nccl',
-                                    world_size=world_size,
-                                    rank=rank)
-            logging.info("Process group set for distributed training")
-
-            params["trainer"]["cuda_device"] = rank
-            params["trainer"]["world_size"] = world_size
-
-        pieces = TrainerPieces.from_params(params,  # pylint: disable=no-member
-                                           serialization_dir,
-                                           recover,
-                                           cache_directory,
-                                           cache_prefix)
-        trainer = Trainer.from_params(model=pieces.model,
-                                      serialization_dir=serialization_dir,
-                                      iterator=pieces.iterator,
-                                      train_data=pieces.train_dataset,
-                                      validation_data=pieces.validation_dataset,
-                                      params=pieces.params,
-                                      validation_iterator=pieces.validation_iterator)
-
-        params.assert_empty('base train command')
-
-        try:
-            metrics = trainer.train()
-        except KeyboardInterrupt:
-            # if we have completed an epoch, try to create a model archive.
-            if master and os.path.exists(os.path.join(serialization_dir, _DEFAULT_WEIGHTS)):
-                logging.info("Training interrupted by the user. Attempting to create "
-                             "a model archive using the current best epoch weights.")
-                archive_model(serialization_dir, files_to_archive=params.files_to_archive)
-            raise
-
-        if master:
-            # Evaluate
-            evaluation_iterator = pieces.validation_iterator or pieces.iterator
-            evaluation_dataset = pieces.test_dataset
-
-            if evaluation_dataset and evaluate_on_test:
-                logger.info("The model will be evaluated using the best epoch weights.")
-                test_metrics = evaluate(trainer.model, evaluation_dataset, evaluation_iterator,
-                                        cuda_device=trainer._cuda_devices[0],  # pylint: disable=protected-access,
-                                        # TODO(brendanr): Pass in an arg following Joel's trainer refactor.
-                                        batch_weight_key="")
-
-                for key, value in test_metrics.items():
-                    metrics["test_" + key] = value
-            elif evaluation_dataset:
-                logger.info("To evaluate on the test set after training, pass the "
-                            "'evaluate_on_test' flag, or use the 'allennlp evaluate' command.")
-            dump_metrics(os.path.join(serialization_dir, "metrics.json"), metrics, log=True)
-    except:
-        traceback.print_exc()
-    else:
-        logging.info("worker done")
+            for key, value in test_metrics.items():
+                metrics["test_" + key] = value
+        elif evaluation_dataset:
+            logger.info("To evaluate on the test set after training, pass the "
+                        "'evaluate_on_test' flag, or use the 'allennlp evaluate' command.")
+        dump_metrics(os.path.join(serialization_dir, "metrics.json"), metrics, log=True)
