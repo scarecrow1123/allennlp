@@ -9,7 +9,6 @@ from typing import Dict, Optional, List, Tuple, Union, Iterable, Any
 import torch
 import torch.distributed as dist
 import torch.optim.lr_scheduler
-from apex import amp
 
 from allennlp.common import Params
 from allennlp.common.checks import ConfigurationError, parse_cuda_device
@@ -62,7 +61,6 @@ class Trainer(TrainerBase):
                  should_log_learning_rate: bool = False,
                  log_batch_size_period: Optional[int] = None,
                  moving_average: Optional[MovingAverage] = None,
-                 mixed_precision: bool = False,
                  distributed: bool = False,
                  rank: int = 0,
                  world_size: int = 1) -> None:
@@ -249,11 +247,6 @@ class Trainer(TrainerBase):
         if histogram_interval is not None:
             self._tensorboard.enable_activation_logging(self.model)
 
-        self._mixed_precision = mixed_precision
-
-        if self._mixed_precision:
-            self.model, self.optimizer = amp.initialize(self.model, self.optimizer, opt_level="O2", verbosity=0)
-
         self._distributed = distributed
         self._rank = rank
         self._master = rank == 0
@@ -353,12 +346,7 @@ class Trainer(TrainerBase):
             if torch.isnan(loss):
                 raise ValueError("nan loss encountered")
 
-            # For mixed precision, amp requires a separate way of handling as below
-            if self._mixed_precision:
-                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+            loss.backward()
 
             train_loss += loss.item()
 
@@ -780,7 +768,6 @@ class Trainer(TrainerBase):
         should_log_learning_rate = params.pop_bool("should_log_learning_rate", False)
         log_batch_size_period = params.pop_int("log_batch_size_period", None)
 
-        mixed_precision = params.pop_bool("mixed_precision", False)
 
         distributed = params.pop_bool("distributed", False)
         world_size = params.pop_int("world_size", 1)
@@ -812,7 +799,6 @@ class Trainer(TrainerBase):
                    should_log_learning_rate=should_log_learning_rate,
                    log_batch_size_period=log_batch_size_period,
                    moving_average=moving_average,
-                   mixed_precision=mixed_precision,
                    distributed=distributed,
                    rank=rank,
                    world_size=world_size)
