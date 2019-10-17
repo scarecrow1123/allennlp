@@ -385,12 +385,9 @@ def aggregate_metrics_from_dist_group(metrics: Dict[str, float], world_size: int
     aggregated_metrics = {}
     for metric_name, metric_val in metrics.items():
         metric_tensor = torch.tensor(metric_val).to(torch.device(rank))
-        metric_gathered = [torch.ones_like(metric_tensor) for _ in range(world_size)]
-
-        dist.all_gather(metric_gathered, metric_tensor)
-
-        metric_gathered = torch.tensor(metric_gathered)
-        aggregated_metrics[metric_name] = metric_gathered.mean().item()
+        dist.all_reduce(metric_tensor, op=dist.ReduceOp.SUM)
+        reduced_metric = metric_tensor / world_size
+        aggregated_metrics[metric_name] = reduced_metric.item()
 
     return aggregated_metrics
 
