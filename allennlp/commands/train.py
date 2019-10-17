@@ -241,11 +241,11 @@ def train_model(params: Params,
                      include_package)
 
         # Now tar up results
-        archive_model(serialization_dir, files_to_archive=params.files_to_archive)
+    archive_model(serialization_dir, files_to_archive=params.files_to_archive)
 
-        # We count on the trainer to have the model with best weights
-        # return trainer.model
-        return
+    # We count on the trainer to have the model with best weights
+    # return trainer.model
+    return
 
 
 def train_worker(rank: int,
