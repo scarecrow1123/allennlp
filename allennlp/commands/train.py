@@ -213,15 +213,15 @@ def train_model(params: Params,
         The model with the best epoch weights.
     """
     create_serialization_dir(params, serialization_dir, recover, force)
+    params.to_file(os.path.join(serialization_dir, CONFIG_NAME))
+
+    distributed = params.params.get('trainer').get('distributed', False)
 
     cuda_device = params.params.get('trainer').get('cuda_device', -1)
 
     check_for_gpu(cuda_device)
 
     device_id = parse_cuda_device(cuda_device)
-    distributed = isinstance(device_id, list) and len(device_id) > 1
-
-    params.to_file(os.path.join(serialization_dir, CONFIG_NAME))
 
     if distributed:
         logging.info("Switching to distributed training mode since multiple GPUs are configured")
@@ -229,6 +229,9 @@ def train_model(params: Params,
         os.environ['MASTER_PORT'] = '29500'
 
         n_gpus = len(device_id)
+
+        assert n_gpus > 1
+
         torch.multiprocessing.spawn(train_worker, args=(params.duplicate(),
                                                         serialization_dir, recover, cache_directory,
                                                         cache_prefix, n_gpus, include_package),
@@ -267,13 +270,14 @@ def train_worker(rank: int,
         if distributed:
             for package_name in include_package:
                 import_submodules(package_name)
+
             torch.cuda.set_device(rank)
             dist.init_process_group(backend='nccl',
                                     world_size=world_size,
                                     rank=rank)
-            logging.info("Distribution group init done")
+            logging.info("Process group set for distributed training")
+
             params["trainer"]["cuda_device"] = rank
-            params["trainer"]["distributed"] = True
             params["trainer"]["world_size"] = world_size
 
         pieces = TrainerPieces.from_params(params,  # pylint: disable=no-member
