@@ -282,7 +282,7 @@ def train_model(
             recover=recover,
             cache_directory=cache_directory,
             cache_prefix=cache_prefix,
-            include_package=include_package
+            include_package=include_package,
         )
         archive_model(serialization_dir, files_to_archive=params.files_to_archive)
         return model
