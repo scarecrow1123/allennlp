@@ -134,8 +134,9 @@ class TensorboardWriter(FromParams):
                 rate = group["lr"]
                 for param in group["params"]:
                     # check whether params has requires grad or not
-                    effective_rate = rate * float(param.requires_grad)
-                    self.add_train_scalar("learning_rate/" + names[param], effective_rate)
+                    if param in names:
+                        effective_rate = rate * float(param.requires_grad)
+                        self.add_train_scalar("learning_rate/" + names[param], effective_rate)
 
     def log_histograms(self, model: Model, histogram_parameters: Set[str]) -> None:
         """
