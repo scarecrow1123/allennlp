@@ -274,7 +274,7 @@ class Trainer(TrainerBase):
         self._mixed_precision = mixed_precision
 
         if self._mixed_precision:
-            self.model, self.optimizer = amp.initialize(self.model, self.optimizer, opt_level="O2", verbosity=0)
+            self.model, self.optimizer = amp.initialize(self.model, self.optimizer, opt_level="O1", verbosity=0)
 
         # Using `DistributedDataParallel`(ddp) brings in a quirk wrt AllenNLP's `Model` interface and its
         # usage. A `Model` object is wrapped by `ddp`, but assigning the wrapped model to `self.model`
