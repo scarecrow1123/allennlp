@@ -3,6 +3,8 @@ import os
 import re
 from typing import Iterable, NamedTuple
 
+import torch.distributed as dist
+
 from allennlp.common import Params
 from allennlp.common.checks import ConfigurationError
 from allennlp.common.util import get_frozen_and_tunable_parameter_names, is_distributed, is_master
