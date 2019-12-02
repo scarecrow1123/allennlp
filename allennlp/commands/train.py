@@ -42,6 +42,8 @@ which to write the results.
                             0)
       --include-package INCLUDE_PACKAGE
                             additional packages to include
+      --node-rank NODE_RANK
+                            rank of the current node in the distributed distributed
 """
 
 import argparse
