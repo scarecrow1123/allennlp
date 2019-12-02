@@ -325,7 +325,7 @@ def train_model(
         # in each worker will yield only `rank` specific instances. Hence it is safe to construct
         # the vocabulary and write it to disk before initializing the distributed context. The workers
         # will load the vocabulary from the path specified.
-        make_vocab_from_params(params, serialization_dir)
+        make_vocab_from_params(params.duplicate(), serialization_dir)
         params["vocabulary"] = {
             "directory_path": os.path.join(serialization_dir, "vocabulary"),
             "extend": False,  # vocab extension would have been done above
