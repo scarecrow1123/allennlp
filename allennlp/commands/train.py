@@ -42,8 +42,6 @@ which to write the results.
                             0)
       --include-package INCLUDE_PACKAGE
                             additional packages to include
-      --node-rank NODE_RANK
-                            rank of the current node in the distributed distributed
 """
 
 import argparse
@@ -141,7 +139,7 @@ class Train(Subcommand):
         )
 
         subparser.add_argument(
-            "--node-rank", type=int, default=0, help="Rank of this node in the distributed setup"
+            "--node-rank", type=int, help="Rank of this node in the distributed setup"
         )
 
         subparser.set_defaults(func=train_model_from_args)
