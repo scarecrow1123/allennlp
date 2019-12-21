@@ -4,7 +4,7 @@ import math
 import os
 import time
 import traceback
-from typing import Dict, Optional, List, Tuple, Union, Iterable, Any
+from typing import Dict, Optional, Tuple, Union, Iterable, Any
 
 import torch
 import torch.distributed as dist
@@ -12,7 +12,7 @@ import torch.optim.lr_scheduler
 from torch.nn.parallel import DistributedDataParallel
 
 from allennlp.common import Params
-from allennlp.common.checks import ConfigurationError, parse_cuda_device
+from allennlp.common.checks import ConfigurationError, parse_cuda_device, check_for_gpu
 from allennlp.common.tqdm import Tqdm
 from allennlp.common.util import dump_metrics, gpu_memory_mb, peak_memory_mb, lazy_groups_of
 from allennlp.data.instance import Instance
@@ -54,7 +54,7 @@ class Trainer(TrainerBase):
         keep_serialized_model_every_num_seconds: int = None,
         checkpointer: Checkpointer = None,
         model_save_interval: float = None,
-        cuda_device: Union[int, List] = -1,
+        cuda_device: int = -1,
         grad_norm: Optional[float] = None,
         grad_clipping: Optional[float] = None,
         learning_rate_scheduler: Optional[LearningRateScheduler] = None,
@@ -69,6 +69,7 @@ class Trainer(TrainerBase):
         distributed: bool = False,
         rank: int = 0,
         world_size: int = 1,
+        num_gradient_accumulation_steps: int = 1,
     ) -> None:
         """
         A trainer for doing supervised learning. It just takes a labeled dataset
@@ -132,8 +133,10 @@ class Trainer(TrainerBase):
             If provided, then serialize models every ``model_save_interval``
             seconds within single epochs.  In all cases, models are also saved
             at the end of every epoch if ``serialization_dir`` is provided.
-        cuda_device : ``Union[int, List[int]]``, optional (default = -1)
-            An integer or list of integers specifying the CUDA device(s) to use. If -1, the CPU is used.
+        cuda_device : ``int``, optional (default = -1)
+            An integer specifying the CUDA device(s) to use for this process. If -1, the CPU is used.
+            Data parallelism is controlled at the allennlp train level, so each trainer will have a single
+            GPU.
         grad_norm : ``float``, optional, (default = None).
             If provided, gradient norms will be rescaled to have a maximum of this value.
         grad_clipping : ``float``, optional (default = ``None``).
@@ -188,6 +191,10 @@ class Trainer(TrainerBase):
             used as the rank.
         world_size: ``int``, (default = 1)
             The number of `Trainer` workers participating in the distributed training.
+        num_gradient_accumulation_steps: ``int``, optional, (default = 1)
+            Gradients are accumulated for the given number of steps before doing an optimizer step. This can
+            be useful to accommodate batches that are larger than the RAM size. Refer Thomas Wolf's
+            [post](https://tinyurl.com/y5mv44fw) for details on Gradient Accumulation.
         """
         super().__init__(serialization_dir, cuda_device, distributed, rank, world_size)
 
@@ -267,6 +274,8 @@ class Trainer(TrainerBase):
 
         self._last_log = 0.0  # time of last logging
 
+        self._num_gradient_accumulation_steps = num_gradient_accumulation_steps
+
         # Enable activation logging.
         if histogram_interval is not None:
             self._tensorboard.enable_activation_logging(self.model)
@@ -284,25 +293,20 @@ class Trainer(TrainerBase):
         # normal case, reference to `Model` is retained. This reference is only used in
         # these places: `model.__call__`, `model.train` and `model.eval`.
         if self._distributed:
-            self._pytorch_model = DistributedDataParallel(self.model, device_ids=self._cuda_devices)
+            self._pytorch_model = DistributedDataParallel(self.model, device_ids=[self.cuda_device])
         else:
             self._pytorch_model = self.model
 
     def rescale_gradients(self) -> Optional[float]:
         return training_util.rescale_gradients(self.model, self._grad_norm)
 
-    def batch_loss(self, batch_group: List[TensorDict], for_training: bool) -> torch.Tensor:
+    def batch_loss(self, batch: TensorDict, for_training: bool) -> torch.Tensor:
         """
         Does a forward pass on the given batches and returns the ``loss`` value in the result.
         If ``for_training`` is `True` also applies regularization penalty.
         """
-        if self._multiple_gpu:
-            output_dict = training_util.data_parallel(batch_group, self.model, self._cuda_devices)
-        else:
-            assert len(batch_group) == 1
-            batch = batch_group[0]
-            batch = nn_util.move_to_device(batch, self._cuda_devices[0])
-            output_dict = self._pytorch_model(**batch)
+        batch = nn_util.move_to_device(batch, self.cuda_device)
+        output_dict = self._pytorch_model(**batch)
 
         try:
             loss = output_dict["loss"]
@@ -334,12 +338,23 @@ class Trainer(TrainerBase):
         # Set the model to "train" mode.
         self._pytorch_model.train()
 
-        num_gpus = len(self._cuda_devices)
-
         # Get tqdm for the training batches
-        raw_train_generator = self.iterator(self.train_data, num_epochs=1, shuffle=self.shuffle)
-        train_generator = lazy_groups_of(raw_train_generator, num_gpus)
-        num_training_batches = math.ceil(self.iterator.get_num_batches(self.train_data) / num_gpus)
+        batch_generator = self.iterator(self.train_data, num_epochs=1, shuffle=self.shuffle)
+        batch_group_generator = lazy_groups_of(
+            batch_generator, self._num_gradient_accumulation_steps
+        )
+        num_training_batches = math.ceil(
+            self.iterator.get_num_batches(self.train_data) / self._num_gradient_accumulation_steps
+        )
+        # Having multiple tqdm bars in case of distributed training will be a mess. Hence only the master's
+        # progress is shown
+        if self._master:
+            batch_group_generator_tqdm = Tqdm.tqdm(
+                batch_group_generator, total=num_training_batches
+            )
+        else:
+            batch_group_generator_tqdm = batch_group_generator
+
         self._last_log = time.time()
         last_save_time = time.time()
 
@@ -351,34 +366,28 @@ class Trainer(TrainerBase):
 
         logger.info("Training")
 
-        # Having multiple tqdm bars in case of distributed training will be a mess. Hence only the master's
-        # progress is shown
-        if self._master:
-            train_generator_tqdm = Tqdm.tqdm(train_generator, total=num_training_batches)
-        else:
-            train_generator_tqdm = train_generator
-
-        cumulative_batch_size = 0
-        for batch_group in train_generator_tqdm:
+        cumulative_batch_group_size = 0
+        for batch_group in batch_group_generator_tqdm:
             batches_this_epoch += 1
             self._batch_num_total += 1
             batch_num_total = self._batch_num_total
 
             self.optimizer.zero_grad()
 
-            loss = self.batch_loss(batch_group, for_training=True)
+            for batch in batch_group:
+                loss = self.batch_loss(batch, for_training=True)
+                if torch.isnan(loss):
+                    raise ValueError("nan loss encountered")
+                loss = loss / len(batch_group)
 
-            if torch.isnan(loss):
-                raise ValueError("nan loss encountered")
+                # For mixed precision, amp requires a separate way of handling as below
+                if self._mixed_precision:
+                    with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    loss.backward()
 
-            # For mixed precision, amp requires a separate way of handling as below
-            if self._mixed_precision:
-                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
-
-            train_loss += loss.item()
+                train_loss += loss.item()
 
             batch_grad_norm = self.rescale_gradients()
 
@@ -418,13 +427,13 @@ class Trainer(TrainerBase):
                 train_loss,
                 batches_this_epoch,
                 world_size=self._world_size,
-                cuda_device=self._cuda_devices,
+                cuda_device=[self.cuda_device],
             )
 
             # Updating tqdm only for the master as the trainers wouldn't have one
             if self._master:
                 description = training_util.description_from_metrics(metrics)
-                train_generator_tqdm.set_description(description, refresh=False)
+                batch_group_generator_tqdm.set_description(description, refresh=False)
 
             # Log parameter values to Tensorboard (only from the master)
             if self._tensorboard.should_log_this_batch() and self._master:
@@ -438,12 +447,14 @@ class Trainer(TrainerBase):
                 self._tensorboard.log_histograms(self.model, histogram_parameters)
 
             if self._log_batch_size_period:
-                cur_batch = sum([training_util.get_batch_size(batch) for batch in batch_group])
-                cumulative_batch_size += cur_batch
+                batch_group_size = sum(training_util.get_batch_size(batch) for batch in batch_group)
+                cumulative_batch_group_size += batch_group_size
                 if (batches_this_epoch - 1) % self._log_batch_size_period == 0:
-                    average = cumulative_batch_size / batches_this_epoch
-                    logger.info(f"current batch size: {cur_batch} mean batch size: {average}")
-                    self._tensorboard.add_train_scalar("current_batch_size", cur_batch)
+                    average = cumulative_batch_group_size / batches_this_epoch
+                    logger.info(
+                        f"current batch size: {batch_group_size} mean batch size: {average}"
+                    )
+                    self._tensorboard.add_train_scalar("current_batch_size", batch_group_size)
                     self._tensorboard.add_train_scalar("mean_batch_size", average)
 
             # Save model if needed.
@@ -462,7 +473,7 @@ class Trainer(TrainerBase):
             batches_this_epoch,
             reset=True,
             world_size=self._world_size,
-            cuda_device=self._cuda_devices,
+            cuda_device=[self.cuda_device],
         )
         metrics["cpu_memory_MB"] = peak_cpu_usage
         for (gpu_num, memory) in gpu_usage:
@@ -486,19 +497,14 @@ class Trainer(TrainerBase):
         else:
             val_iterator = self.iterator
 
-        num_gpus = len(self._cuda_devices)
-
-        raw_val_generator = val_iterator(self._validation_data, num_epochs=1, shuffle=False)
-        val_generator = lazy_groups_of(raw_val_generator, num_gpus)
-        num_validation_batches = math.ceil(
-            val_iterator.get_num_batches(self._validation_data) / num_gpus
-        )
+        val_generator = val_iterator(self._validation_data, num_epochs=1, shuffle=False)
+        num_validation_batches = val_iterator.get_num_batches(self._validation_data)
         val_generator_tqdm = Tqdm.tqdm(val_generator, total=num_validation_batches)
         batches_this_epoch = 0
         val_loss = 0
-        for batch_group in val_generator_tqdm:
+        for batch in val_generator_tqdm:
 
-            loss = self.batch_loss(batch_group, for_training=False)
+            loss = self.batch_loss(batch, for_training=False)
             if loss is not None:
                 # You shouldn't necessarily have to compute a loss for validation, so we allow for
                 # `loss` to be None.  We need to be careful, though - `batches_this_epoch` is
@@ -514,7 +520,7 @@ class Trainer(TrainerBase):
                 val_loss,
                 batches_this_epoch,
                 world_size=self._world_size,
-                cuda_device=self._cuda_devices,
+                cuda_device=[self.cuda_device],
             )
             description = training_util.description_from_metrics(val_metrics)
             val_generator_tqdm.set_description(description, refresh=False)
@@ -587,7 +593,7 @@ class Trainer(TrainerBase):
                         num_batches,
                         reset=True,
                         world_size=self._world_size,
-                        cuda_device=self._cuda_devices,
+                        cuda_device=[self.cuda_device],
                     )
 
                     # Check validation metric for early stopping
@@ -789,14 +795,11 @@ class Trainer(TrainerBase):
         lr_scheduler_params = params.pop("learning_rate_scheduler", None)
         momentum_scheduler_params = params.pop("momentum_scheduler", None)
 
-        if isinstance(cuda_device, list):
-            model_device = cuda_device[0]
-        else:
-            model_device = cuda_device
-        if model_device >= 0:
+        check_for_gpu(cuda_device)
+        if cuda_device >= 0:
             # Moving model to GPU here so that the optimizer state gets constructed on
             # the right device.
-            model = model.cuda(model_device)
+            model = model.cuda(cuda_device)
 
         parameters = [[n, p] for n, p in model.named_parameters() if p.requires_grad]
         optimizer = Optimizer.from_params(parameters, params.pop("optimizer"))
@@ -849,6 +852,8 @@ class Trainer(TrainerBase):
         distributed = params.pop_bool("distributed", False)
         world_size = params.pop_int("world_size", 1)
 
+        num_gradient_accumulation_steps = params.pop("num_gradient_accumulation_steps", 1)
+
         params.assert_empty(cls.__name__)
         return cls(
             model,
@@ -879,4 +884,5 @@ class Trainer(TrainerBase):
             distributed=distributed,
             rank=local_rank,
             world_size=world_size,
+            num_gradient_accumulation_steps=num_gradient_accumulation_steps,
         )
