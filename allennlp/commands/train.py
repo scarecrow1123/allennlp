@@ -307,6 +307,7 @@ def train_model(
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = str(master_port)
         os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["ALLENNLP_PROCS_PER_NODE"] = str(num_procs)
 
         logging.info(
             f"Switching to distributed training mode since multiple GPUs are configured"
@@ -408,7 +409,7 @@ def _train_worker(
 
     distributed = world_size > 1
 
-    # not using `allennlp.common.util.is_master` as the process group is yet to be initialized
+    # not using `allennlp.common.util.is_local_master` as the process group is yet to be initialized
     master = process_rank == 0
 
     evaluate_on_test = params.pop_bool("evaluate_on_test", False)
@@ -464,6 +465,7 @@ def _train_worker(
             validation_data=pieces.validation_dataset,
             params=pieces.params,
             validation_iterator=pieces.validation_iterator,
+            local_rank=process_rank
         )
 
         evaluation_iterator = pieces.validation_iterator or pieces.iterator

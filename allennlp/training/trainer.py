@@ -67,7 +67,7 @@ class Trainer(TrainerBase):
         moving_average: Optional[MovingAverage] = None,
         mixed_precision: bool = False,
         distributed: bool = False,
-        rank: int = 0,
+        local_rank: int = 0,
         world_size: int = 1,
         num_gradient_accumulation_steps: int = 1,
     ) -> None:
@@ -196,7 +196,7 @@ class Trainer(TrainerBase):
             be useful to accommodate batches that are larger than the RAM size. Refer Thomas Wolf's
             [post](https://tinyurl.com/y5mv44fw) for details on Gradient Accumulation.
         """
-        super().__init__(serialization_dir, cuda_device, distributed, rank, world_size)
+        super().__init__(serialization_dir, cuda_device, distributed, local_rank, world_size)
 
         # I am not calling move_to_gpu here, because if the model is
         # not already on the GPU then the optimizer is going to be wrong.
@@ -884,7 +884,7 @@ class Trainer(TrainerBase):
             moving_average=moving_average,
             mixed_precision=mixed_precision,
             distributed=distributed,
-            rank=local_rank,
+            local_rank=local_rank,
             world_size=world_size,
             num_gradient_accumulation_steps=num_gradient_accumulation_steps,
         )

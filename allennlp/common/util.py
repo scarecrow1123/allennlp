@@ -4,15 +4,15 @@ Various utilities that don't fit anwhere else.
 import importlib
 import json
 import logging
-import os
 import pkgutil
 import random
 import subprocess
 import sys
-import torch.distributed as dist
 from itertools import zip_longest, islice
 from logging import Filter
 from typing import Any, Callable, Dict, List, Tuple, TypeVar, Iterable, Iterator
+
+import torch.distributed as dist
 
 try:
     import resource
@@ -23,6 +23,7 @@ except ImportError:
 import torch
 import numpy
 import spacy
+import os
 from spacy.cli.download import download as spacy_download
 from spacy.language import Language as SpacyModelType
 
@@ -504,19 +505,21 @@ def flatten_filename(file_path: str) -> str:
     return file_path.replace("/", "_SLASH_")
 
 
-def is_master(rank: int = None, world_size: int = None) -> bool:
+def is_local_master(global_rank: int = None, world_size: int = None, num_procs_per_node: int = None) -> bool:
     """
-    Checks if the process is a "master" in a distributed process group. If a
+    Checks if the process is a "master" of its node in a distributed process group. If a
     process group is not initialized, this returns `True`.
 
     Parameters
     ----------
-    rank : int ( default = None )
+    global_rank : int ( default = None )
         Global rank of the process if in a distributed process group. If not
         given, rank is obtained using `torch.distributed.get_rank()`
     world_size : int ( default = None )
         Number of processes in the distributed group. If not
         given, this is obtained using `torch.distributed.get_world_size()`
+    num_procs_per_node: int ( default = None ),
+        Number of GPU processes running per node
     """
     distributed = is_distributed()
 
@@ -526,16 +529,44 @@ def is_master(rank: int = None, world_size: int = None) -> bool:
     if not distributed:
         return True
 
-    if rank is None:
-        rank = dist.get_rank()
+    if global_rank is None:
+        global_rank = dist.get_rank()
 
     if world_size is None:
         world_size = dist.get_world_size()
 
+    if num_procs_per_node is None:
+        num_procs_per_node = os.environ["ALLENNLP_PROCS_PER_NODE"]
+
     # rank == 0 would do in a single-node multi-GPU setup. However,
     # in a multi-node case, every node has a logical master and hence
     # the mod(%) op.
-    return world_size % rank == 0
+    return global_rank % (world_size / num_procs_per_node) == 0
+
+
+def is_global_master(global_rank: int = None) -> bool:
+    """
+    Checks if the process is a "master" in a distributed process group. If a
+    process group is not initialized, this returns `True`.
+
+    Parameters
+    ----------
+    global_rank : int ( default = None )
+        Global rank of the process if in a distributed process group. If not
+        given, rank is obtained using `torch.distributed.get_rank()`
+    """
+    distributed = is_distributed()
+
+    # In non-distributed case, a "master" process doesn't make any
+    # sense. So instead of raising an error, returning True would
+    # make things less painful
+    if not distributed:
+        return True
+
+    if global_rank is None:
+        global_rank = dist.get_rank()
+
+    return global_rank == 0
 
 
 def is_distributed() -> bool:
