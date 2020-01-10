@@ -535,7 +535,7 @@ def is_master(rank: int = None, world_size: int = None) -> bool:
     # rank == 0 would do in a single-node multi-GPU setup. However,
     # in a multi-node case, every node has a logical master and hence
     # the mod(%) op.
-    return rank % world_size == 0
+    return world_size % rank == 0
 
 
 def is_distributed() -> bool:
