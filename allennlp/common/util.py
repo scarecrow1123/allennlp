@@ -536,7 +536,7 @@ def is_local_master(global_rank: int = None, world_size: int = None, num_procs_p
         world_size = dist.get_world_size()
 
     if num_procs_per_node is None:
-        num_procs_per_node = os.environ.get("ALLENNLP_PROCS_PER_NODE")
+        num_procs_per_node = int(os.environ.get("ALLENNLP_PROCS_PER_NODE"))
 
     # rank == 0 would do in a single-node multi-GPU setup. However,
     # in a multi-node case, every node has a logical master and hence
