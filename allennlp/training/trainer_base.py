@@ -62,6 +62,7 @@ class TrainerBase(Registrable):
         self._distributed = distributed
         self._rank = rank
         self._master = is_master()
+        logger.info(f"*** Rank of trainer {self._rank}. Is this a master? {self._master}")
         self._world_size = world_size
 
     def _move_to_gpu(self, model: Model) -> Model:
