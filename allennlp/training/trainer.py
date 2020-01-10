@@ -367,6 +367,7 @@ class Trainer(TrainerBase):
         histogram_parameters = set(self.model.get_parameters_for_histogram_tensorboard_logging())
 
         logger.info("Training")
+        logger.info(f"Debug info *&************* {self._rank}. Is this the master? {self._master}")
 
         cumulative_batch_group_size = 0
         for batch_group in batch_group_generator_tqdm:
