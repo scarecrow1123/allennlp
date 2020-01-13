@@ -404,7 +404,7 @@ def _train_worker(
 
     distributed = world_size > 1
 
-    # not using `allennlp.common.util.is_local_master` as the process group is yet to be initialized
+    # not using `allennlp.common.util.is_master` as the process group is yet to be initialized
     master = process_rank == 0
 
     evaluate_on_test = params.pop_bool("evaluate_on_test", False)
@@ -422,6 +422,8 @@ def _train_worker(
         # the process group using `init_process_group`
         global_rank = node_rank * num_procs_per_node + process_rank
 
+        # Number of processes per node is useful to know if a process
+        # is a master in the local node(node in which it is running)
         os.environ["ALLENNLP_PROCS_PER_NODE"] = str(num_procs_per_node)
 
         # In distributed training, the configured device is always going to be a list.
@@ -462,7 +464,7 @@ def _train_worker(
             validation_data=pieces.validation_dataset,
             params=pieces.params,
             validation_iterator=pieces.validation_iterator,
-            local_rank=process_rank
+            local_rank=process_rank,
         )
 
         evaluation_iterator = pieces.validation_iterator or pieces.iterator

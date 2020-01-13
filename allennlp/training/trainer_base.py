@@ -12,7 +12,7 @@ import logging
 from typing import Dict, Any
 
 from allennlp.common import Params, Registrable
-from allennlp.common.util import is_local_master
+from allennlp.common.util import is_master
 from allennlp.common.checks import ConfigurationError, check_for_gpu
 from allennlp.models.model import Model
 
@@ -38,7 +38,6 @@ class TrainerBase(Registrable):
     ) -> None:
 
         check_for_gpu(cuda_device)
-
         self._serialization_dir = serialization_dir
 
         if isinstance(cuda_device, list):
