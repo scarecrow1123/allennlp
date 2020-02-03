@@ -37,20 +37,14 @@ def main(checks):
                 " --no-site-packages "
                 # We are extremely lax about specifying Optional[] types, so we need this flag.
                 # TODO: tighten up our type annotations and remove this
-                " --no-strict-optional",
+                " --no-strict-optional"
+                # Some versions of mypy crash randomly when caching, probably because of our use of
+                # NamedTuple (https://github.com/python/mypy/issues/7281).
+                " --cache-dir=/dev/null",
                 shell=True,
                 check=True,
             )
             print("mypy checks passed")
-
-        if "build-docs" in checks:
-            print("Documentation (build):", flush=True)
-            run("cd doc; make html-strict", shell=True, check=True)
-
-        if "check-docs" in checks:
-            print("Documentation (check):", flush=True)
-            run("./scripts/check_docs.py", shell=True, check=True)
-            print("check docs passed")
 
         if "check-links" in checks:
             print("Checking links in Markdown files:", flush=True)
@@ -73,8 +67,6 @@ if __name__ == "__main__":
         "flake8",
         "mypy",
         "black",
-        "build-docs",
-        "check-docs",
         "check-links",
         "check-requirements",
         "check-large-files",
