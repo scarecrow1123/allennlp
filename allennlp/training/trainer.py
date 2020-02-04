@@ -280,6 +280,11 @@ class Trainer(TrainerBase):
         if histogram_interval is not None:
             self._tensorboard.enable_activation_logging(self.model)
 
+        self._mixed_precision = mixed_precision
+
+        if self._mixed_precision:
+            self.model, self.optimizer = amp.initialize(self.model, self.optimizer, opt_level="O1", verbosity=0)
+
         # Using `DistributedDataParallel`(ddp) brings in a quirk wrt AllenNLP's `Model` interface and its
         # usage. A `Model` object is wrapped by `ddp`, but assigning the wrapped model to `self.model`
         # will break the usages such as `Model.get_regularization_penalty`, `Model.get_metrics`, etc.
@@ -293,8 +298,6 @@ class Trainer(TrainerBase):
             )
         else:
             self._pytorch_model = self.model
-
-        self._mixed_precision = mixed_precision
 
     def rescale_gradients(self) -> Optional[float]:
         return training_util.rescale_gradients(self.model, self._grad_norm)
