@@ -801,6 +801,7 @@ class Trainer(TrainerBase):
         learning_rate_scheduler: Lazy[LearningRateScheduler] = None,
         momentum_scheduler: Lazy[MomentumScheduler] = None,
         moving_average: Lazy[MovingAverage] = None,
+        mixed_precision: bool = False,
         checkpointer: Lazy[Checkpointer] = None,
     ) -> "Trainer":
         """
