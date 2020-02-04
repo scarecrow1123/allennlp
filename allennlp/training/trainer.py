@@ -294,6 +294,8 @@ class Trainer(TrainerBase):
         else:
             self._pytorch_model = self.model
 
+        self._mixed_precision = mixed_precision
+
     def rescale_gradients(self) -> Optional[float]:
         return training_util.rescale_gradients(self.model, self._grad_norm)
 
