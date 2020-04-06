@@ -102,7 +102,7 @@ setup(
     license="Apache",
     packages=find_packages(exclude=["*.tests", "*.tests.*", "tests.*", "tests"]),
     install_requires=[
-        "torch>=1.2.0",
+        "torch",
         "jsonnet>=0.10.0 ; sys.platform != 'win32'",
         "overrides==2.8.0",
         "nltk",
@@ -121,6 +121,9 @@ setup(
         "conllu==2.2.1",
         "transformers>=2.1.1,!=2.2.1,!=2.2.2",
         "jsonpickle",
+    ],
+    dependency_links=[
+        "https://download.pytorch.org/whl/nightly/cu101/torch_nightly.html"
     ],
     entry_points={"console_scripts": ["allennlp=allennlp.run:run"]},
     setup_requires=setup_requirements,

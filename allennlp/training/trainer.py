@@ -29,8 +29,6 @@ from allennlp.training.optimizers import Optimizer
 from allennlp.training.tensorboard_writer import TensorboardWriter
 from allennlp.training.trainer_base import TrainerBase
 
-from apex import amp
-
 
 logger = logging.getLogger(__name__)
 
@@ -283,7 +281,7 @@ class Trainer(TrainerBase):
         self._mixed_precision = mixed_precision
 
         if self._mixed_precision:
-            self.model, self.optimizer = amp.initialize(self.model, self.optimizer, opt_level="O1", verbosity=0)
+            self._scaler = torch.cuda.amp.GradScaler()
 
         # Using `DistributedDataParallel`(ddp) brings in a quirk wrt AllenNLP's `Model` interface and its
         # usage. A `Model` object is wrapped by `ddp`, but assigning the wrapped model to `self.model`
@@ -376,20 +374,27 @@ class Trainer(TrainerBase):
 
             self.optimizer.zero_grad()
 
-            for batch in batch_group:
-                loss = self.batch_loss(batch, for_training=True)
-                if torch.isnan(loss):
-                    raise ValueError("nan loss encountered")
-                loss = loss / len(batch_group)
+            if self._mixed_precision:
+                with torch.cuda.amp.autocast():
+                    for batch in batch_group:
+                        loss = self.batch_loss(batch, for_training=True)
+                        if torch.isnan(loss):
+                            raise ValueError("nan loss encountered")
+                        loss = loss / len(batch_group)
+                self._scaler.scale(loss).backward()
+            else:
+                for batch in batch_group:
+                    loss = self.batch_loss(batch, for_training=True)
+                    if torch.isnan(loss):
+                        raise ValueError("nan loss encountered")
+                    loss = loss / len(batch_group)
 
-                # For mixed precision, amp requires a separate way of handling as below
-                if self._mixed_precision:
-                    with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                        scaled_loss.backward()
-                else:
-                    loss.backward()
+                loss.backward()
 
-                train_loss += loss.item()
+            train_loss += loss.item()
+
+            if self._mixed_precision:
+                self._scaler.unscale_(optimizer)
 
             batch_grad_norm = self.rescale_gradients()
 
@@ -417,7 +422,8 @@ class Trainer(TrainerBase):
                         "gradient_update/" + name, update_norm / (param_norm + 1e-7)
                     )
             else:
-                self.optimizer.step()
+                self._scaler.step(self.optimizer)
+                self._scaler.update()
 
             # Update moving averages
             if self._moving_average is not None:
