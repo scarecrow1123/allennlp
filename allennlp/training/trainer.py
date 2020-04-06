@@ -422,8 +422,11 @@ class Trainer(TrainerBase):
                         "gradient_update/" + name, update_norm / (param_norm + 1e-7)
                     )
             else:
-                self._scaler.step(self.optimizer)
-                self._scaler.update()
+                if self._mixed_precision:
+                    self._scaler.step(self.optimizer)
+                    self._scaler.update()
+                else:
+                    self.optimizer.step()
 
             # Update moving averages
             if self._moving_average is not None:
